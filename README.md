@@ -54,16 +54,22 @@ Each agent runs in its own isolated workspace with separate memory, session hist
 - iMessage-style animated gradient chat bubbles using Apple Intelligence color palette
 - Thinking animation — gradient pulse speeds up while agent is responding
 - Gleam effect on the latest agent message bubble
+- Animated agent status dot — distinct pulse speeds for thinking and responding, solid green on idle
 - Streaming responses with typewriter effect (adaptive speed, drains fully on completion)
 - Typing indicator ("Eve is thinking…")
-- Agent sidebar with last message preview and timestamp
+- Agent sidebar with live last message preview and timestamp — updates in real time
+- Cross-agent streaming guard — blocks sending to a second agent while the first is still responding
 - Inline markdown rendering — bold, italic, and code formatting inside bubbles
+- Links in chat bubbles styled in pink with underline
 - Large paste detection — text over 10 lines collapses into a compact pill UI
-- Settings panel with heartbeat editor and personality matrix editor
+- Settings panel with heartbeat editor and Personality Matrix editor
+- Personality Matrix — separate editors for Agent Soul and Agent Identity, each with undo and backup
+- In-app API key manager (Agentics menu → API Keys…) — Anthropic and OpenAI keys, Touch ID to reveal masked keys, env variable conflict detection
 - Chat history persisted per agent with 500 message cap
 - Sentinel-based scroll anchoring — timing-independent scroll to bottom
 - Text selection enabled on all chat bubbles
 - Single shared WebSocket manager — prevents token stream mixing between agents
+- Bubble animations limited to last 10 messages for smooth scrolling on long conversations
 
 ---
 
@@ -76,16 +82,22 @@ Each agent runs in its own isolated workspace with separate memory, session hist
 - **Transport:** WebSocket (`ws://127.0.0.1:18789`)
 - **Auth:** Ed25519 device signing with challenge/response handshake
 - **Data:** JSON-based chat history (`CHAT.json` per agent workspace)
+- **Security:** LocalAuthentication (Touch ID), CryptoKit, atomic file writes
 
 ---
 
 ## Roadmap
 
 **Near Term**
+- USER.md tab in Personality Matrix
+- File attachment support
+- Touch ID gating for sensitive agent file write operations
 - Council Mode — Eve spawns Nova and Orion in parallel and synthesizes their responses
 - Core ML agent routing — on-device classifier suggests the best agent as you type
-- Touch ID gating for sensitive agent file operations
-- File attachment support
+- Model picker dropdown
+- Clear conversation button
+- Liquid Glass input bar (macOS 26)
+- Dynamic agent avatars — uses NaturalLanguage to analyze conversation sentiment every 8 messages and regenerates each agent's photo automatically via Apple's ImageCreator API
 
 **Long Term**
 - iOS app (SwiftUI port + Tailscale for remote gateway access)
@@ -103,4 +115,3 @@ See [PORTFOLIO.md](PORTFOLIO.md) for a full technical write-up including archite
 ## License
 
 MIT License — see [LICENSE](LICENSE) for details.
-
