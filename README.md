@@ -49,18 +49,22 @@ Each agent runs in its own isolated workspace with separate memory, session hist
 
 ---
 
-## Features
+## Engineering Highlights
 
-- iMessage-style animated gradient chat bubbles using Apple Intelligence color palette
-- Thinking animation — gradient pulse speeds up while agent is responding
-- Gleam effect on the latest agent message bubble
-- Animated agent status dot — distinct pulse speeds for thinking and responding, solid green on idle
+- Solved concurrent streaming across multiple agents without token mixing by using a single shared WebSocket manager and controlled stream routing
+- Built timing-independent scroll behavior using a sentinel-based anchoring system to reliably keep the view pinned during real-time updates
+- Designed cross-agent interaction guards to prevent UI and state conflicts when multiple agents are active simultaneously
+- Implemented adaptive streaming UI (typewriter + drain completion) to balance responsiveness with readability during high-frequency updates
+
+---
+
+## Core Features
+
 - Streaming responses with typewriter effect (adaptive speed, drains fully on completion)
 - Typing indicator ("Eve is thinking…")
 - Agent sidebar with live last message preview and timestamp — updates in real time
 - Cross-agent streaming guard — blocks sending to a second agent while the first is still responding
 - Inline markdown rendering — bold, italic, and code formatting inside bubbles
-- Links in chat bubbles styled in pink with underline
 - Large paste detection — text over 10 lines collapses into a compact pill UI
 - Settings panel with heartbeat editor and Personality Matrix editor
 - Personality Matrix — separate editors for Agent Soul and Agent Identity, each with undo and backup
@@ -69,16 +73,17 @@ Each agent runs in its own isolated workspace with separate memory, session hist
 - Sentinel-based scroll anchoring — timing-independent scroll to bottom
 - Text selection enabled on all chat bubbles
 - Single shared WebSocket manager — prevents token stream mixing between agents
-- Bubble animations limited to last 10 messages for smooth scrolling on long conversations
 
 ---
 
-## Engineering Highlights
+## UX & Polish
 
-- Solved concurrent streaming across multiple agents without token mixing by using a single shared WebSocket manager and controlled stream routing
-- Built timing-independent scroll behavior using a sentinel-based anchoring system to reliably keep the view pinned during real-time updates
-- Designed cross-agent interaction guards to prevent UI and state conflicts when multiple agents are active simultaneously
-- Implemented adaptive streaming UI (typewriter + drain completion) to balance responsiveness with readability during high-frequency updates
+- iMessage-style animated gradient chat bubbles using Apple Intelligence color palette
+- Thinking animation — gradient pulse speeds up while agent is responding
+- Gleam effect on the latest agent message bubble
+- Animated agent status dot — distinct pulse speeds for thinking and responding, solid green on idle
+- Links in chat bubbles styled in pink with underline
+- Bubble animations limited to last 10 messages for smooth scrolling on long conversations
 
 ---
 
@@ -99,16 +104,14 @@ Each agent runs in its own isolated workspace with separate memory, session hist
 
 **Near Term**
 - USER.md tab in Personality Matrix
-- File attachment support
-- Touch ID gating for sensitive agent file write operations
 - Council Mode — Eve spawns Nova and Orion in parallel and synthesizes their responses
 - Core ML agent routing — on-device classifier suggests the best agent as you type
 - Model picker dropdown
-- Clear conversation button
-- Liquid Glass input bar (macOS 26)
 - Dynamic agent avatars — uses NaturalLanguage to analyze conversation sentiment every 8 messages and regenerates each agent's photo automatically via Apple's ImageCreator API
 
 **Long Term**
+- File attachment support
+- Touch ID gating for sensitive agent file write operations
 - iOS app (SwiftUI port + Tailscale for remote gateway access)
 - visionOS app — spatial multi-agent interface, one floating panel per agent
 - Voice input via push-to-talk
@@ -124,4 +127,3 @@ See [PORTFOLIO.md](PORTFOLIO.md) for a full technical write-up including archite
 ## License
 
 MIT License — see [LICENSE](LICENSE) for details.
-
