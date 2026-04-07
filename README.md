@@ -12,6 +12,19 @@ Agentics is a custom macOS desktop app for managing and chatting with multiple A
 
 Built to go beyond what the default OpenClaw web UI offers — native, fast, and visually distinct.
 
+## Why This Project Matters
+
+This project focuses on real-world system behavior rather than just UI or features. It demonstrates debugging and stabilizing a real-time application where issues like race conditions, state inconsistencies, and streaming failures occur under specific timing conditions.
+
+Key areas explored include:
+- Handling asynchronous UI updates and maintaining consistent state across multiple active agents  
+- Debugging race conditions in real-time streaming environments  
+- Working with partially documented protocols and implementing WebSocket-based communication  
+- Identifying and reproducing edge cases through repeated testing and real usage patterns  
+- Thinking from a QA perspective: focusing on failure modes, reproducibility, and system reliability  
+
+The goal was not just to build a functional app, but to understand and resolve the kinds of issues that arise in real production systems.
+
 ---
 
 ## Demo
