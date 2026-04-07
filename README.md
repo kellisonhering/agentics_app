@@ -19,9 +19,7 @@ Built to go beyond what the default OpenClaw web UI offers — native, fast, and
 **Streaming response with animated gradient bubbles**
 
 <div align="center">
-
-https://github.com/user-attachments/assets/aa164576-5b29-4e94-862e-dde7b0f3229c
-
+  <video src="https://github.com/user-attachments/assets/aa164576-5b29-4e94-862e-dde7b0f3229c" width="300"></video>
 </div>
 
 ![Streaming response demo](assets/streaming.gif)
