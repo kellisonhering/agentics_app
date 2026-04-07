@@ -37,9 +37,12 @@ https://github.com/user-attachments/assets/0d246bdc-3f59-498a-a52f-05111bd85497
 ---
 
 **Agent sidebar with last message preview**
-> *GIF placeholder — replace with sidebar.gif*
 
-![Sidebar demo](assets/sidebar.gif)
+<div align="center">
+
+https://github.com/user-attachments/assets/eca02a0b-e990-4a22-9ce6-199ca3c000f5
+
+</div>
 
 ---
 
