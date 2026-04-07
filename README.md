@@ -2,7 +2,7 @@
 
 **A native macOS AI agent interface built with SwiftUI**
 
-`Active Development` • `macOS` • `SwiftUI` • `Single-File Architecture`
+`Active Development` • `macOS` • `SwiftUI`
 
 ---
 
@@ -91,7 +91,6 @@ Each agent runs in its own isolated workspace with separate memory, session hist
 
 - **Language:** Swift
 - **Framework:** SwiftUI (macOS)
-- **Architecture:** Single-file app (`AgenticsApp.swift`)
 - **AI Providers:** Anthropic (Claude Haiku 4.5, Claude Sonnet 4.6), OpenAI (GPT-4o-mini)
 - **Transport:** WebSocket (`ws://127.0.0.1:18789`)
 - **Auth:** Ed25519 device signing with challenge/response handshake
@@ -127,3 +126,4 @@ See [PORTFOLIO.md](PORTFOLIO.md) for a full technical write-up including archite
 ## License
 
 MIT License — see [LICENSE](LICENSE) for details.
+
