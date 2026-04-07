@@ -36,7 +36,7 @@ https://github.com/user-attachments/assets/0d246bdc-3f59-498a-a52f-05111bd85497
 
 ---
 
-**Agent sidebar with last message preview**
+**Settings — Personality Matrix & Heartbeat Editor**
 
 <div align="center">
 
