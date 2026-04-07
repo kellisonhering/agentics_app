@@ -20,11 +20,9 @@ Built to go beyond what the default OpenClaw web UI offers — native, fast, and
 
 <div align="center">
 
-
+https://github.com/user-attachments/assets/ab7162ad-89b0-4c4f-851e-a0dd6b5e24dd
   
 </div>
-
-![Streaming response demo](assets/streaming.gif)
 
 ---
 
