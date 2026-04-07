@@ -25,9 +25,12 @@ Built to go beyond what the default OpenClaw web UI offers — native, fast, and
 ---
 
 **Thinking animation — pulse speeds up while agent responds**
-> *GIF placeholder — replace with thinking.gif*
 
+<div align="center">
+  
 https://github.com/user-attachments/assets/0d246bdc-3f59-498a-a52f-05111bd85497
+
+</div>
 
 ---
 
