@@ -17,13 +17,25 @@ Built to go beyond what the default OpenClaw web UI offers — native, fast, and
 This project focuses on real-world system behavior rather than just UI or features. It demonstrates debugging and stabilizing a real-time application where issues like race conditions, state inconsistencies, and streaming failures occur under specific timing conditions.
 
 Key areas explored include:
-- Handling asynchronous UI updates and maintaining consistent state across multiple active agents  
-- Debugging race conditions in real-time streaming environments  
-- Working with partially documented protocols and implementing WebSocket-based communication  
-- Identifying and reproducing edge cases through repeated testing and real usage patterns  
-- Thinking from a QA perspective: focusing on failure modes, reproducibility, and system reliability  
+- Handling asynchronous UI updates and maintaining consistent state across multiple active agents
+- Debugging race conditions in real-time streaming environments
+- Working with partially documented protocols and implementing WebSocket-based communication
+- Identifying and reproducing edge cases through repeated testing and real usage patterns
+- Thinking from a QA perspective: focusing on failure modes, reproducibility, and system reliability
 
 The goal was not just to build a functional app, but to understand and resolve the kinds of issues that arise in real production systems.
+
+---
+
+## Requirements
+
+Agentics connects to a self-hosted [OpenClaw](https://openclaw.ai) gateway via WebSocket.
+
+To run the full app experience, you will need:
+- OpenClaw installed and running
+- A valid gateway token set as `OPENCLAW_GATEWAY_TOKEN` environment variable
+
+Without the gateway, the UI can still be explored, but agent responses will not function.
 
 ---
 
@@ -34,7 +46,7 @@ The goal was not just to build a functional app, but to understand and resolve t
 <div align="center">
 
 https://github.com/user-attachments/assets/ab7162ad-89b0-4c4f-851e-a0dd6b5e24dd
-  
+
 </div>
 
 ---
@@ -42,7 +54,7 @@ https://github.com/user-attachments/assets/ab7162ad-89b0-4c4f-851e-a0dd6b5e24dd
 **Thinking animation — pulse speeds up while agent responds**
 
 <div align="center">
-  
+
 https://github.com/user-attachments/assets/0d246bdc-3f59-498a-a52f-05111bd85497
 
 </div>
@@ -77,6 +89,25 @@ Each agent runs in its own isolated workspace with separate memory, session hist
 - Built timing-independent scroll behavior using a sentinel-based anchoring system to reliably keep the view pinned during real-time updates
 - Designed cross-agent interaction guards to prevent UI and state conflicts when multiple agents are active simultaneously
 - Implemented adaptive streaming UI (typewriter + drain completion) to balance responsiveness with readability during high-frequency updates
+
+---
+
+## Testing
+
+The WebSocket token routing logic — the core fix for the multi-agent stream mixing bug — is covered by automated unit tests using XCTest. The WebSocket manager was extracted into its own file (`WebSocketManager.swift`) to make it independently testable without requiring a live gateway connection.
+
+Tests simulate gateway frames directly by calling the manager's frame handler, verifying that:
+
+- Tokens from a streaming response are delivered only to the agent that sent the message
+- After a stream completes, a new sender's tokens route correctly to the new handler
+- If a second agent sends while the first is still streaming, the handler switches immediately with no token leakage
+- Empty deltas from the gateway are filtered out and never delivered to the UI
+- The "final" frame clears the handler so stray tokens after stream completion are dropped
+- The active agent ID tracks correctly as ownership changes between agents
+
+These tests validate the current single-handler routing design, which replaced an earlier approach that could intermittently mix tokens between agents.
+
+See [`AgenticsTests/WebSocketManagerTests.swift`](AgenticsTests/WebSocketManagerTests.swift) for the full test suite.
 
 ---
 
@@ -118,6 +149,7 @@ Each agent runs in its own isolated workspace with separate memory, session hist
 - **Auth:** Ed25519 device signing with challenge/response handshake
 - **Data:** JSON-based chat history (`CHAT.json` per agent workspace)
 - **Security:** LocalAuthentication (Touch ID), CryptoKit, atomic file writes
+- **Testing:** XCTest (unit tests for WebSocket token routing)
 
 ---
 
@@ -148,4 +180,3 @@ See [PORTFOLIO.md](PORTFOLIO.md) for a full technical write-up including archite
 ## License
 
 MIT License — see [LICENSE](LICENSE) for details.
-
