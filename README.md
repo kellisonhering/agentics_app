@@ -33,7 +33,7 @@ Agentics connects to a self-hosted [OpenClaw](https://openclaw.ai) gateway via W
 
 To run the full app experience, you will need:
 - OpenClaw installed and running
-- A valid gateway token set as `OPENCLAW_GATEWAY_TOKEN` environment variable
+- A valid gateway token configured for the OpenClaw gateway (for example via `OPENCLAW_GATEWAY_TOKEN`)
 
 Without the gateway, the UI can still be explored, but agent responses will not function.
 
