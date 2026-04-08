@@ -155,11 +155,13 @@ class OpenClawWebSocket: NSObject, URLSessionWebSocketDelegate {
     typealias TokenHandler = (String) -> Void
     typealias ErrorHandler = (String) -> Void
 
-    private let gatewayURL = URL(string: "ws://127.0.0.1:18789")!
-    private let configPath = "~/.openclaw/openclaw.json"
+    private let gatewayURL: URL
+    private let configPath: String
+    private let testToken: String?
 
     private var authToken: String {
-        OpenClawLoader.shared.readGatewayToken(configPath: configPath) ?? ""
+        if let token = testToken { return token }
+        return OpenClawLoader.shared.readGatewayToken(configPath: configPath) ?? ""
     }
 
     private var webSocketTask: URLSessionWebSocketTask?
@@ -168,12 +170,28 @@ class OpenClawWebSocket: NSObject, URLSessionWebSocketDelegate {
     private var isReady     = false
 
     private var pendingMessage:      String?
-    private var pendingAgentID:      String?
+    private(set) var pendingAgentID: String?
     private var pendingTokenHandler: TokenHandler?
     private var pendingErrorHandler: ErrorHandler?
 
     private var connectRequestID: String?
     private var chatRequestID:    String?
+
+    // Default init for production use — reads token from config
+    override init() {
+        self.gatewayURL = URL(string: "ws://127.0.0.1:18789")!
+        self.configPath = "~/.openclaw/openclaw.json"
+        self.testToken = nil
+        super.init()
+    }
+
+    // Test init — accepts a dummy token, no config file needed
+    init(authToken: String) {
+        self.gatewayURL = URL(string: "ws://127.0.0.1:18789")!
+        self.configPath = "~/.openclaw/openclaw.json"
+        self.testToken = authToken
+        super.init()
+    }
 
     func send(message: String, agentID: String, onToken: @escaping TokenHandler, onError: @escaping ErrorHandler) {
         pendingMessage      = message
@@ -275,7 +293,9 @@ class OpenClawWebSocket: NSObject, URLSessionWebSocketDelegate {
         }
     }
 
-    private func handleFrame(_ text: String) {
+    /// Parses and routes a single WebSocket frame.
+    /// `internal` (not private) so unit tests can feed simulated frames directly.
+    func handleFrame(_ text: String) {
         guard let data = text.data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             print("[OpenClawWS] ⚠️ Unparseable frame: \(text.prefix(200))")
@@ -662,7 +682,7 @@ struct Agent: Identifiable, Hashable {
 }
 
 enum AgentStatus {
-    case idle, thinking, responding, error
+    case idle, thinking, responding, error, restarting
 
     var label: String {
         switch self {
@@ -670,6 +690,7 @@ enum AgentStatus {
         case .thinking:   return "Thinking..."
         case .responding: return "Responding..."
         case .error:      return "Error"
+        case .restarting: return "Restarting..."
         }
     }
 
@@ -679,6 +700,7 @@ enum AgentStatus {
         case .thinking:   return .yellow
         case .responding: return .blue
         case .error:      return .red
+        case .restarting: return .yellow
         }
     }
 
@@ -1859,6 +1881,8 @@ struct HeartbeatEditorView: View {
     @State private var customInterval: String   = ""
     @State private var showCustomField = false
     @State private var intervalSaved   = false
+    @State private var isRestarting    = false
+    @State private var restartFailed   = false
 
     let presets = ["30m", "1h", "2h", "4h", "6h", "12h", "24h", "Custom"]
 
@@ -1874,9 +1898,53 @@ struct HeartbeatEditorView: View {
         }
         agent.heartbeatInterval = interval
         let success = state.saveHeartbeatInterval(for: agent)
-        if success {
-            intervalSaved = true
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { intervalSaved = false }
+        guard success else { return }
+
+        // Set all agents to restarting (solid yellow)
+        for i in state.agents.indices {
+            state.agents[i].status = .restarting
+        }
+        isRestarting = true
+        restartFailed = false
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/local/bin/openclaw")
+            process.arguments = ["gateway", "restart"]
+            process.environment = [
+                "PATH": "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+                "HOME": NSHomeDirectory()
+            ]
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = pipe
+
+            var restartSuccess = false
+            do {
+                try process.run()
+                process.waitUntilExit()
+                restartSuccess = process.terminationStatus == 0
+            } catch {
+                restartSuccess = false
+            }
+
+            DispatchQueue.main.async {
+                self.isRestarting = false
+                if restartSuccess {
+                    self.intervalSaved = true
+                    self.restartFailed = false
+                    for i in self.state.agents.indices {
+                        self.state.agents[i].status = .idle
+                    }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 3) { self.intervalSaved = false }
+                } else {
+                    self.restartFailed = true
+                    for i in self.state.agents.indices {
+                        self.state.agents[i].status = .error
+                    }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 5) { self.restartFailed = false }
+                }
+            }
         }
     }
 
@@ -1915,10 +1983,20 @@ struct HeartbeatEditorView: View {
                 }
 
                 HStack {
-                    if intervalSaved {
+                    if isRestarting {
+                        HStack(spacing: 4) {
+                            ProgressView().scaleEffect(0.5).frame(width: 10, height: 10)
+                            Text("Restarting gateway...").font(.system(size: 11)).foregroundColor(.yellow)
+                        }
+                    } else if restartFailed {
+                        HStack(spacing: 4) {
+                            Image(systemName: "xmark.circle.fill").foregroundColor(.red).font(.system(size: 11))
+                            Text("Restart failed").font(.system(size: 11)).foregroundColor(.red)
+                        }
+                    } else if intervalSaved {
                         HStack(spacing: 4) {
                             Image(systemName: "checkmark.circle.fill").foregroundColor(.green).font(.system(size: 11))
-                            Text("Saved").font(.system(size: 11)).foregroundColor(.green)
+                            Text("Saved and restarted").font(.system(size: 11)).foregroundColor(.green)
                         }
                     } else {
                         Text("Currently: \(agent.heartbeatInterval == "off" ? "Off" : agent.heartbeatInterval)")
@@ -1926,13 +2004,14 @@ struct HeartbeatEditorView: View {
                     }
                     Spacer()
                     Button(action: saveInterval) {
-                        Text("Apply")
+                        Text(isRestarting ? "Restarting..." : "Apply")
                             .font(.system(size: 11, weight: .semibold)).foregroundColor(.white)
                             .padding(.horizontal, 14).padding(.vertical, 5)
                             .background(Color.blue.opacity(0.6)).cornerRadius(6)
                             .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.white.opacity(0.15), lineWidth: 0.5))
                     }
                     .buttonStyle(.plain)
+                    .disabled(isRestarting)
                 }
             }
             .padding(10).frame(maxWidth: .infinity)
@@ -2062,6 +2141,7 @@ struct APIKeyManagerView: View {
     @State private var anthropicRevealed: Bool = false
     @State private var openAIRevealed: Bool = false
     @State private var gatewayRevealed: Bool = false
+    @State private var isRestarting: Bool = false
 
     // Check for env variable conflicts
     var anthropicEnvConflict: Bool { ProcessInfo.processInfo.environment["ANTHROPIC_API_KEY"] != nil }
@@ -2277,6 +2357,21 @@ struct APIKeyManagerView: View {
                         }
                         .buttonStyle(.plain)
                         .help(gatewayRevealed ? "Hide token" : "Reveal token with Touch ID")
+
+                        Button(action: {
+                            var bytes = [UInt8](repeating: 0, count: 24)
+                            _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+                            gatewayToken = bytes.map { String(format: "%02x", $0) }.joined()
+                            gatewayRevealed = true
+                        }) {
+                            Image(systemName: "arrow.triangle.2.circlepath")
+                                .font(.system(size: 13))
+                                .foregroundColor(Color.white.opacity(0.4))
+                                .frame(width: 32, height: 32)
+                                .glassBackground(opacity: 0.08, cornerRadius: 8, borderOpacity: 0.12)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Generate new token")
                     }
                 }
 
@@ -2294,17 +2389,24 @@ struct APIKeyManagerView: View {
                 HStack {
                     Spacer()
                     Button(action: saveKeys) {
-                        Text("Save Keys")
-                            .font(.system(size: 13, weight: .semibold))
-                            .foregroundColor(.white)
-                            .padding(.horizontal, 20)
-                            .padding(.vertical, 8)
-                            .background(Color.blue.opacity(0.7))
-                            .cornerRadius(8)
-                            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.white.opacity(0.15), lineWidth: 0.5))
+                        HStack(spacing: 6) {
+                            if isRestarting {
+                                ProgressView()
+                                    .scaleEffect(0.6)
+                                    .frame(width: 12, height: 12)
+                            }
+                            Text(isRestarting ? "Restarting..." : "Save Keys")
+                                .font(.system(size: 13, weight: .semibold))
+                                .foregroundColor(.white)
+                        }
+                        .padding(.horizontal, 20)
+                        .padding(.vertical, 8)
+                        .background(Color.blue.opacity(0.7))
+                        .cornerRadius(8)
+                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.white.opacity(0.15), lineWidth: 0.5))
                     }
                     .buttonStyle(.plain)
-                    .disabled(anthropicKey.isEmpty && openAIKey.isEmpty && gatewayToken.isEmpty)
+                    .disabled((anthropicKey.isEmpty && openAIKey.isEmpty && gatewayToken.isEmpty) || isRestarting)
                 }
 
                 Spacer()
@@ -2398,15 +2500,69 @@ struct APIKeyManagerView: View {
             }
         }
 
-        if failCount == 0 {
-            saveStatus = "Saved to \(successCount) agent(s) successfully"
-            isError = false
-        } else {
+        if failCount > 0 {
             saveStatus = "Saved \(successCount), failed \(failCount)"
             isError = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { saveStatus = nil }
+            return
         }
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { saveStatus = nil }
+        // Attempt gateway restart
+        saveStatus = "Saved. Restarting gateway..."
+        isError = false
+        isRestarting = true
+
+        // Set all agents to restarting (solid yellow) during restart
+        for i in state.agents.indices {
+            state.agents[i].status = .restarting
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/local/bin/openclaw")
+            process.arguments = ["gateway", "restart"]
+            process.environment = [
+                "PATH": "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+                "HOME": NSHomeDirectory()
+            ]
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = pipe
+
+            var restartSuccess = false
+            do {
+                try process.run()
+                process.waitUntilExit()
+                let outputData = pipe.fileHandleForReading.readDataToEndOfFile()
+                let output = String(data: outputData, encoding: .utf8) ?? ""
+                print("[APIKeyManager] Gateway restart exit code: \(process.terminationStatus)")
+                print("[APIKeyManager] Gateway restart output: \(output)")
+                restartSuccess = process.terminationStatus == 0
+            } catch {
+                print("[APIKeyManager] Gateway restart error: \(error)")
+                restartSuccess = false
+            }
+
+            DispatchQueue.main.async {
+                self.isRestarting = false
+                if restartSuccess {
+                    self.saveStatus = "Saved and gateway restarted"
+                    self.isError = false
+                    // Set all agents back to idle (green)
+                    for i in self.state.agents.indices {
+                        self.state.agents[i].status = .idle
+                    }
+                } else {
+                    self.saveStatus = "Saved but gateway restart failed. Restart manually from Terminal."
+                    self.isError = true
+                    // Set all agents to error state (red)
+                    for i in self.state.agents.indices {
+                        self.state.agents[i].status = .error
+                    }
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 5) { self.saveStatus = nil }
+            }
+        }
     }
 }
 

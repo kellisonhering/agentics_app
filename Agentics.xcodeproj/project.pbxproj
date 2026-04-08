@@ -3,7 +3,7 @@
 	archiveVersion = 1;
 	classes = {
 	};
-	objectVersion = 56;
+	objectVersion = 70;
 	objects = {
 
 /* Begin PBXBuildFile section */
@@ -11,7 +11,18 @@
 		A1000002 /* AgenticsCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000002 /* AgenticsCore.swift */; };
 /* End PBXBuildFile section */
 
+/* Begin PBXContainerItemProxy section */
+		76016EE82F863838002D1E85 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = A8000000 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = A5000000;
+			remoteInfo = Agentics;
+		};
+/* End PBXContainerItemProxy section */
+
 /* Begin PBXFileReference section */
+		76016EE42F863837002D1E85 /* AgenticsTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = AgenticsTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		76C9EAE52F63962500FFFD6C /* Agentics.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = Agentics.entitlements; sourceTree = "<group>"; };
 		A2000000 /* Agentics.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Agentics.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		A2000001 /* AgenticsApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgenticsApp.swift; sourceTree = "<group>"; };
@@ -19,7 +30,18 @@
 		A2000003 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
+/* Begin PBXFileSystemSynchronizedRootGroup section */
+		76016EE52F863837002D1E85 /* AgenticsTests */ = {isa = PBXFileSystemSynchronizedRootGroup; explicitFileTypes = {}; explicitFolders = (); path = AgenticsTests; sourceTree = "<group>"; };
+/* End PBXFileSystemSynchronizedRootGroup section */
+
 /* Begin PBXFrameworksBuildPhase section */
+		76016EE12F863837002D1E85 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		A3000000 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
@@ -34,6 +56,7 @@
 			isa = PBXGroup;
 			children = (
 				A4000001 /* Agentics */,
+				76016EE52F863837002D1E85 /* AgenticsTests */,
 				A4000002 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -53,6 +76,7 @@
 			isa = PBXGroup;
 			children = (
 				A2000000 /* Agentics.app */,
+				76016EE42F863837002D1E85 /* AgenticsTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -60,6 +84,29 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
+		76016EE32F863837002D1E85 /* AgenticsTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 76016EEA2F863838002D1E85 /* Build configuration list for PBXNativeTarget "AgenticsTests" */;
+			buildPhases = (
+				76016EE02F863837002D1E85 /* Sources */,
+				76016EE12F863837002D1E85 /* Frameworks */,
+				76016EE22F863837002D1E85 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				76016EE92F863838002D1E85 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				76016EE52F863837002D1E85 /* AgenticsTests */,
+			);
+			name = AgenticsTests;
+			packageProductDependencies = (
+			);
+			productName = AgenticsTests;
+			productReference = 76016EE42F863837002D1E85 /* AgenticsTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 		A5000000 /* Agentics */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = A7000000 /* Build configuration list for PBXNativeTarget "Agentics" */;
@@ -84,9 +131,13 @@
 			isa = PBXProject;
 			attributes = {
 				BuildIndependentTargetsInParallel = 1;
-				LastSwiftUpdateCheck = 1500;
+				LastSwiftUpdateCheck = 2640;
 				LastUpgradeCheck = 1500;
 				TargetAttributes = {
+					76016EE32F863837002D1E85 = {
+						CreatedOnToolsVersion = 26.4;
+						TestTargetID = A5000000;
+					};
 					A5000000 = {
 						CreatedOnToolsVersion = 15.0;
 					};
@@ -106,11 +157,19 @@
 			projectRoot = "";
 			targets = (
 				A5000000 /* Agentics */,
+				76016EE32F863837002D1E85 /* AgenticsTests */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
+		76016EE22F863837002D1E85 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		A6000001 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -121,6 +180,13 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
+		76016EE02F863837002D1E85 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		A6000000 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -132,7 +198,60 @@
 		};
 /* End PBXSourcesBuildPhase section */
 
+/* Begin PBXTargetDependency section */
+		76016EE92F863838002D1E85 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = A5000000 /* Agentics */;
+			targetProxy = 76016EE82F863838002D1E85 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
 /* Begin XCBuildConfiguration section */
+		76016EEB2F863838002D1E85 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = JA6MFFB892;
+				GENERATE_INFOPLIST_FILE = YES;
+				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.4;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.kellisonjames.AgenticsTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				STRING_CATALOG_GENERATE_SYMBOLS = NO;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Agentics.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Agentics";
+			};
+			name = Debug;
+		};
+		76016EEC2F863838002D1E85 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = JA6MFFB892;
+				GENERATE_INFOPLIST_FILE = YES;
+				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.4;
+				MARKETING_VERSION = 1.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				PRODUCT_BUNDLE_IDENTIFIER = com.kellisonjames.AgenticsTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				STRING_CATALOG_GENERATE_SYMBOLS = NO;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Agentics.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Agentics";
+			};
+			name = Release;
+		};
 		A9000000 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -299,6 +418,15 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
+		76016EEA2F863838002D1E85 /* Build configuration list for PBXNativeTarget "AgenticsTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				76016EEB2F863838002D1E85 /* Debug */,
+				76016EEC2F863838002D1E85 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
 		A7000000 /* Build configuration list for PBXNativeTarget "Agentics" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
