@@ -14,6 +14,18 @@ Built to go beyond what the default OpenClaw web UI offers — native, fast, and
 
 ---
 
+## Requirements
+
+Agentics connects to a self-hosted [OpenClaw](https://openclaw.ai) gateway via WebSocket.
+
+To run the full app experience, you will need:
+- OpenClaw installed and running
+- A valid gateway token configured in `openclaw.json`
+
+Without the gateway, the UI can still be explored, but agent responses will not function.
+
+---
+
 ## Demo
 
 **Streaming response with animated gradient bubbles**

@@ -156,7 +156,11 @@ class OpenClawWebSocket: NSObject, URLSessionWebSocketDelegate {
     typealias ErrorHandler = (String) -> Void
 
     private let gatewayURL = URL(string: "ws://127.0.0.1:18789")!
-    private let authToken  = "ada0c72b300bf0245fec8b18867c673d58f52caa17c123f3"
+    private let configPath = "~/.openclaw/openclaw.json"
+
+    private var authToken: String {
+        OpenClawLoader.shared.readGatewayToken(configPath: configPath) ?? ""
+    }
 
     private var webSocketTask: URLSessionWebSocketTask?
     private var urlSession: URLSession?
@@ -512,6 +516,44 @@ class OpenClawLoader {
         let path = (heartbeatMDPath(for: agentConfig, defaults: defaults) as NSString).expandingTildeInPath
         do { try content.write(toFile: path, atomically: true, encoding: .utf8); return true }
         catch { return false }
+    }
+
+    func readGatewayToken(configPath: String) -> String? {
+        let expandedPath = (configPath as NSString).expandingTildeInPath
+        guard let data = FileManager.default.contents(atPath: expandedPath),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let gateway = json["gateway"] as? [String: Any],
+              let auth = gateway["auth"] as? [String: Any],
+              let token = auth["token"] as? String else { return nil }
+        return token
+    }
+
+    func writeGatewayToken(_ token: String, configPath: String) -> Bool {
+        let expandedPath = (configPath as NSString).expandingTildeInPath
+        guard let data = FileManager.default.contents(atPath: expandedPath),
+              var rawJson = String(data: data, encoding: .utf8) else { return false }
+
+        let pattern = "\"token\":\\s*\"[^\"]*\""
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(in: rawJson, range: NSRange(rawJson.startIndex..., in: rawJson)),
+              let swiftRange = Range(match.range, in: rawJson) else { return false }
+
+        // Find the match that's inside gateway.auth (not inside agents)
+        // We look for the one preceded by "mode": "token" nearby
+        let matches = regex.matches(in: rawJson, range: NSRange(rawJson.startIndex..., in: rawJson))
+        for m in matches {
+            guard let r = Range(m.range, in: rawJson) else { continue }
+            let before = rawJson[rawJson.startIndex..<r.lowerBound]
+            // Check if this token field is inside gateway.auth by looking for "mode" nearby
+            if before.contains("\"mode\": \"token\"") || before.contains("\"mode\":\"token\"") {
+                rawJson.replaceSubrange(r, with: "\"token\": \"\(token)\"")
+                do {
+                    try rawJson.write(toFile: expandedPath, atomically: true, encoding: .utf8)
+                    return true
+                } catch { return false }
+            }
+        }
+        return false
     }
 
     func chatJSONPath(for agent: AgentConfig, defaults: AgentDefaults) -> String {
@@ -1048,12 +1090,15 @@ struct ChatView: View {
                                     }
                                 )), id: \.0.id) { message, sideIndex in
                                     let isLastAgentMsg = !message.isUser && message.id == messages.last?.id
+                                    let messageIndex = messages.firstIndex(where: { $0.id == message.id }) ?? 0
+                                    let shouldAnimate = messageIndex >= messages.count - 10
                                     MessageBubbleView(
                                         message: message,
                                         agent: agent,
                                         sideIndex: sideIndex,
                                         isThinking: isLastAgentMsg && message.content.isEmpty,
-                                        isLatest: isLastAgentMsg && !message.content.isEmpty
+                                        isLatest: isLastAgentMsg && !message.content.isEmpty,
+                                        shouldAnimate: shouldAnimate
                                     )
                                     .id(message.id)
                                     .listRowBackground(Color.clear)
@@ -1161,6 +1206,7 @@ struct AnimatedGradientBubble: View {
     let index: Int
     var isThinking: Bool = false
     var isLatest: Bool = false
+    var shouldAnimate: Bool = true
     @State private var shift: CGFloat = 0
 
     var body: some View {
@@ -1230,7 +1276,7 @@ struct AnimatedGradientBubble: View {
             }
         }
         .onAppear {
-            guard shift == 0 else { return }
+            guard shouldAnimate, shift == 0 else { return }
             let delay = Double(index % 8) * 0.45
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
                 withAnimation(.easeInOut(duration: isThinking ? 0.6 : 3.0).repeatForever(autoreverses: true)) {
@@ -1239,6 +1285,7 @@ struct AnimatedGradientBubble: View {
             }
         }
         .onChange(of: isThinking) { thinking in
+            guard shouldAnimate else { return }
             shift = 0
             withAnimation(.easeInOut(duration: thinking ? 0.6 : 3.0).repeatForever(autoreverses: true)) {
                 shift = 0.25
@@ -1253,6 +1300,7 @@ struct MessageBubbleView: View {
     let sideIndex: Int
     var isThinking: Bool = false
     var isLatest: Bool = false
+    var shouldAnimate: Bool = true
 
     func markdownText(_ string: String) -> Text {
         if var attributed = try? AttributedString(
@@ -1280,7 +1328,7 @@ struct MessageBubbleView: View {
                         .font(.system(size: 13)).foregroundColor(.white)
                         .textSelection(.enabled)
                         .padding(.horizontal, 12).padding(.vertical, 7)
-                        .background(AnimatedGradientBubble(isUser: true, index: sideIndex))
+                        .background(AnimatedGradientBubble(isUser: true, index: sideIndex, shouldAnimate: shouldAnimate))
                     Text(timeString(message.timestamp)).font(.system(size: 10)).foregroundColor(Color.white.opacity(0.3))
                 }
             } else {
@@ -1293,7 +1341,7 @@ struct MessageBubbleView: View {
                         .font(.system(size: 13)).foregroundColor(.white)
                         .textSelection(.enabled)
                         .padding(.horizontal, 12).padding(.vertical, 7)
-                        .background(AnimatedGradientBubble(isUser: false, index: sideIndex, isThinking: isThinking, isLatest: isLatest))
+                        .background(AnimatedGradientBubble(isUser: false, index: sideIndex, isThinking: isThinking, isLatest: isLatest, shouldAnimate: shouldAnimate))
                     Text(timeString(message.timestamp)).font(.system(size: 10)).foregroundColor(Color.white.opacity(0.3))
                 }
                 Spacer(minLength: 60)
@@ -2008,14 +2056,17 @@ struct APIKeyManagerView: View {
 
     @State private var anthropicKey: String = ""
     @State private var openAIKey: String = ""
+    @State private var gatewayToken: String = ""
     @State private var saveStatus: String? = nil
     @State private var isError: Bool = false
     @State private var anthropicRevealed: Bool = false
     @State private var openAIRevealed: Bool = false
+    @State private var gatewayRevealed: Bool = false
 
     // Check for env variable conflicts
     var anthropicEnvConflict: Bool { ProcessInfo.processInfo.environment["ANTHROPIC_API_KEY"] != nil }
     var openAIEnvConflict: Bool { ProcessInfo.processInfo.environment["OPENAI_API_KEY"] != nil }
+    var gatewayEnvConflict: Bool { ProcessInfo.processInfo.environment["OPENCLAW_GATEWAY_TOKEN"] != nil }
 
     func authenticate(completion: @escaping (Bool) -> Void) {
         let context = LAContext()
@@ -2045,13 +2096,13 @@ struct APIKeyManagerView: View {
                         .buttonStyle(.plain)
                 }
 
-                Text("Keys are saved to each agent's auth-profiles.json and will be used the next time the gateway loads credentials.")
+                Text("API keys are saved to each agent's auth-profiles.json. The gateway token is saved to openclaw.json. Changes take effect the next time the gateway loads credentials.")
                     .font(.system(size: 11))
                     .foregroundColor(Color.white.opacity(0.35))
                     .fixedSize(horizontal: false, vertical: true)
 
                 // Env variable conflict warning
-                if anthropicEnvConflict || openAIEnvConflict {
+                if anthropicEnvConflict || openAIEnvConflict || gatewayEnvConflict {
                     HStack(alignment: .top, spacing: 8) {
                         Image(systemName: "exclamationmark.triangle.fill")
                             .foregroundColor(.orange)
@@ -2061,7 +2112,12 @@ struct APIKeyManagerView: View {
                             Text("Environment variable conflict detected")
                                 .font(.system(size: 12, weight: .semibold))
                                 .foregroundColor(.orange)
-                            Text("\(anthropicEnvConflict && openAIEnvConflict ? "ANTHROPIC_API_KEY and OPENAI_API_KEY are" : anthropicEnvConflict ? "ANTHROPIC_API_KEY is" : "OPENAI_API_KEY is") set in your shell environment and may override the keys saved here. Remove \(anthropicEnvConflict && openAIEnvConflict ? "them" : "it") from ~/.zshrc to avoid conflicts.")
+                            let conflicts = [
+                                anthropicEnvConflict ? "ANTHROPIC_API_KEY" : nil,
+                                openAIEnvConflict ? "OPENAI_API_KEY" : nil,
+                                gatewayEnvConflict ? "OPENCLAW_GATEWAY_TOKEN" : nil
+                            ].compactMap { $0 }
+                            Text("\(conflicts.joined(separator: " and ")) \(conflicts.count == 1 ? "is" : "are") set in your shell environment and may override the values saved here. Remove \(conflicts.count == 1 ? "it" : "them") from ~/.zshrc to avoid conflicts.")
                                 .font(.system(size: 11))
                                 .foregroundColor(Color.orange.opacity(0.8))
                                 .fixedSize(horizontal: false, vertical: true)
@@ -2173,6 +2229,57 @@ struct APIKeyManagerView: View {
                     }
                 }
 
+                // Gateway Token
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Label("Gateway Token", systemImage: "lock.shield")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundColor(Color.white.opacity(0.5))
+                        if gatewayEnvConflict {
+                            Text("ENV OVERRIDE ACTIVE")
+                                .font(.system(size: 9, weight: .bold))
+                                .foregroundColor(.orange)
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 2)
+                                .background(Color.orange.opacity(0.15))
+                                .cornerRadius(4)
+                        }
+                    }
+                    HStack(spacing: 8) {
+                        Group {
+                            if gatewayRevealed {
+                                TextField("Gateway auth token...", text: $gatewayToken)
+                            } else {
+                                SecureField("Gateway auth token...", text: $gatewayToken)
+                            }
+                        }
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 13))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 10)
+                        .glassBackground(opacity: 0.08, cornerRadius: 8, borderOpacity: gatewayEnvConflict ? 0.4 : 0.15)
+
+                        Button(action: {
+                            if gatewayRevealed {
+                                gatewayRevealed = false
+                            } else {
+                                authenticate { success in
+                                    if success { gatewayRevealed = true }
+                                }
+                            }
+                        }) {
+                            Image(systemName: gatewayRevealed ? "eye.slash" : "eye")
+                                .font(.system(size: 13))
+                                .foregroundColor(Color.white.opacity(0.4))
+                                .frame(width: 32, height: 32)
+                                .glassBackground(opacity: 0.08, cornerRadius: 8, borderOpacity: 0.12)
+                        }
+                        .buttonStyle(.plain)
+                        .help(gatewayRevealed ? "Hide token" : "Reveal token with Touch ID")
+                    }
+                }
+
                 if let status = saveStatus {
                     HStack(spacing: 6) {
                         Image(systemName: isError ? "xmark.circle.fill" : "checkmark.circle.fill")
@@ -2197,24 +2304,30 @@ struct APIKeyManagerView: View {
                             .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.white.opacity(0.15), lineWidth: 0.5))
                     }
                     .buttonStyle(.plain)
-                    .disabled(anthropicKey.isEmpty && openAIKey.isEmpty)
+                    .disabled(anthropicKey.isEmpty && openAIKey.isEmpty && gatewayToken.isEmpty)
                 }
 
                 Spacer()
             }
             .padding(28)
         }
-        .frame(width: 420, height: 360)
+        .frame(width: 420, height: 460)
         .preferredColorScheme(.dark)
         .onAppear { loadCurrentKeys() }
         .onDisappear {
             anthropicRevealed = false
             openAIRevealed = false
+            gatewayRevealed = false
         }
     }
 
     func loadCurrentKeys() {
-        // Load existing keys from the first agent that has them
+        // Load gateway token from openclaw.json
+        if gatewayToken.isEmpty, let token = OpenClawLoader.shared.readGatewayToken(configPath: state.configPath) {
+            gatewayToken = token
+        }
+
+        // Load existing API keys from the first agent that has them
         for agent in state.agents {
             guard let agentConfig = agent.agentConfig else { continue }
             let agentDir = agentConfig.agentDir ?? ""
@@ -2237,6 +2350,16 @@ struct APIKeyManagerView: View {
         var successCount = 0
         var failCount = 0
 
+        // Save gateway token to openclaw.json
+        if !gatewayToken.isEmpty {
+            if OpenClawLoader.shared.writeGatewayToken(gatewayToken, configPath: state.configPath) {
+                successCount += 1
+            } else {
+                failCount += 1
+            }
+        }
+
+        // Save API keys to each agent's auth-profiles.json
         for agent in state.agents {
             guard let agentConfig = agent.agentConfig else { continue }
             let agentDir = agentConfig.agentDir ?? ""
