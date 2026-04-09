@@ -5,6 +5,7 @@
 // Proves that streamingAgents correctly blocks sending while any agent is active.
 
 import XCTest
+import SwiftUI
 @testable import Agentics
 
 final class AppStateTests: XCTestCase {
