@@ -12,17 +12,33 @@ import ImageIO
 @MainActor
 class AgentAvatarService: ObservableObject {
 
-    @Published var avatarImages:        [String: CGImage]   = [:]
-    @Published var agentDNA:            [String: String]    = [:]
-    @Published var generatingAgents:    Set<String>         = []
-    @Published var lastError:           [String: String]    = [:]
-    @Published var avatarHistory:       [String: [CGImage]] = [:]
-    @Published var selectedHistoryIndex:[String: Int]       = [:]
+    @Published var avatarImages:         [String: CGImage]   = [:]
+    @Published var agentDNA:             [String: String]    = [:]
+    @Published var generatingAgents:     Set<String>         = []
+    @Published var lastError:            [String: String]    = [:]
+    @Published var avatarHistory:        [String: [CGImage]] = [:]
+    @Published var selectedHistoryIndex: [String: Int]       = [:]
+    @Published var generationDisabled:   Set<String>         = []
 
     private var messageCounters: [String: Int] = [:]
 
     static let triggerInterval  = 3
     static let historyMaxCount  = 5
+
+    // MARK: - Generation Toggle
+
+    func isGenerationEnabled(for agentId: String) -> Bool {
+        !generationDisabled.contains(agentId)
+    }
+
+    func setGeneration(enabled: Bool, for agentId: String) {
+        if enabled {
+            generationDisabled.remove(agentId)
+        } else {
+            generationDisabled.insert(agentId)
+        }
+        UserDefaults.standard.set(!enabled, forKey: "avatarGenDisabled_\(agentId)")
+    }
 
     // MARK: - Lifecycle
 
@@ -32,12 +48,16 @@ class AgentAvatarService: ObservableObject {
             loadAvatar(agentId: agent.id, workspacePath: expanded)
             loadDNA(agentId: agent.id, workspacePath: expanded)
             loadHistory(agentId: agent.id, workspacePath: expanded)
+            if UserDefaults.standard.bool(forKey: "avatarGenDisabled_\(agent.id)") {
+                generationDisabled.insert(agent.id)
+            }
         }
     }
 
     // MARK: - Message Counter
 
     func didReceiveMessage(for agent: Agent, messages: [Message]) {
+        guard isGenerationEnabled(for: agent.id) else { return }
         let count = (messageCounters[agent.id] ?? 0) + 1
         messageCounters[agent.id] = count
 

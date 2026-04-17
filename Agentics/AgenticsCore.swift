@@ -171,8 +171,19 @@ class OpenClawWebSocket: NSObject, URLSessionWebSocketDelegate {
 
     private var pendingMessage:      String?
     private(set) var pendingAgentID: String?
-    private var pendingTokenHandler: TokenHandler?
-    private var pendingErrorHandler: ErrorHandler?
+
+    // Session-keyed handlers — routes tokens to the correct agent conversation
+    private var tokenHandlers: [String: TokenHandler] = [:]
+    private var errorHandlers: [String: ErrorHandler] = [:]
+    private var runToSession:  [String: String]        = [:] // runId → sessionKey
+
+    /// Broadcasts an error to every registered error handler and clears them.
+    private func broadcastError(_ message: String) {
+        let handlers = Array(errorHandlers.values)
+        errorHandlers.removeAll()
+        tokenHandlers.removeAll()
+        DispatchQueue.main.async { handlers.forEach { $0(message) } }
+    }
 
     private var connectRequestID: String?
     private var chatRequestID:    String?
@@ -194,10 +205,11 @@ class OpenClawWebSocket: NSObject, URLSessionWebSocketDelegate {
     }
 
     func send(message: String, agentID: String, onToken: @escaping TokenHandler, onError: @escaping ErrorHandler) {
-        pendingMessage      = message
-        pendingAgentID      = agentID
-        pendingTokenHandler = onToken
-        pendingErrorHandler = onError
+        let sessionKey = "agent:\(agentID):main"
+        pendingMessage  = message
+        pendingAgentID  = agentID
+        tokenHandlers[sessionKey] = onToken
+        errorHandlers[sessionKey] = onError
 
         if webSocketTask == nil {
             connect()
@@ -241,7 +253,7 @@ class OpenClawWebSocket: NSObject, URLSessionWebSocketDelegate {
             scopes:     "operator.read,operator.write",
             token:      authToken
         ) else {
-            pendingErrorHandler?("Failed to sign connect challenge")
+            broadcastError("Failed to sign connect challenge")
             cleanup(); return
         }
 
@@ -279,7 +291,7 @@ class OpenClawWebSocket: NSObject, URLSessionWebSocketDelegate {
             switch result {
             case .failure(let error):
                 print("[OpenClawWS] ❌ Receive error: \(error)")
-                self.pendingErrorHandler?("Connection error: \(error.localizedDescription)")
+                self.broadcastError("Connection error: \(error.localizedDescription)")
                 self.cleanup()
             case .success(let msg):
                 switch msg {
@@ -320,13 +332,13 @@ class OpenClawWebSocket: NSObject, URLSessionWebSocketDelegate {
                     let errorObj = json["error"] as? [String: Any]
                     let reason   = errorObj?["message"] as? String ?? "connect rejected"
                     print("[OpenClawWS] ❌ Connect failed: \(reason)")
-                    pendingErrorHandler?("Connect failed: \(reason)")
+                    broadcastError("Connect failed: \(reason)")
                     cleanup()
                 }
             } else if frameID == chatRequestID {
                 if !ok {
                     let reason = (json["payload"] as? [String: Any])?["reason"] as? String ?? "chat.send failed"
-                    DispatchQueue.main.async { self.pendingErrorHandler?("Chat error: \(reason)") }
+                    self.broadcastError("Chat error: \(reason)")
                 }
             }
 
@@ -344,25 +356,39 @@ class OpenClawWebSocket: NSObject, URLSessionWebSocketDelegate {
                 sendConnectRequest(nonce: nonce, ts: ts)
 
             case "agent":
-                let stream = payload?["stream"] as? String ?? ""
-                if stream == "assistant" {
+                let sessionKey = payload?["sessionKey"] as? String ?? ""
+                let runId      = payload?["runId"]      as? String ?? ""
+                let stream     = payload?["stream"]     as? String ?? ""
+
+                // Track runId → sessionKey so we can clean up on lifecycle end
+                if !runId.isEmpty && !sessionKey.isEmpty {
+                    runToSession[runId] = sessionKey
+                }
+
+                if stream == "assistant", let handler = tokenHandlers[sessionKey] {
                     let data  = payload?["data"] as? [String: Any]
                     let delta = data?["delta"] as? String ?? ""
                     if !delta.isEmpty {
-                        print("[OpenClawWS] Token: \(delta)")
-                        DispatchQueue.main.async { self.pendingTokenHandler?(delta) }
+                        print("[OpenClawWS] Token → \(sessionKey): \(delta)")
+                        DispatchQueue.main.async { handler(delta) }
+                    }
+                } else if stream == "lifecycle" {
+                    let phase = (payload?["data"] as? [String: Any])?["phase"] as? String ?? ""
+                    if phase == "end" && !sessionKey.isEmpty {
+                        print("[OpenClawWS] Stream complete → \(sessionKey)")
+                        let handler = tokenHandlers.removeValue(forKey: sessionKey)
+                        errorHandlers.removeValue(forKey: sessionKey)
+                        if !runId.isEmpty { runToSession.removeValue(forKey: runId) }
+                        DispatchQueue.main.async { handler?("") }
                     }
                 }
 
             case "chat":
                 let state = payload?["state"] as? String ?? ""
                 if state == "final" {
-                    print("[OpenClawWS] Stream complete")
-                    let handler = self.pendingTokenHandler
-                    self.pendingTokenHandler = nil
-                    self.pendingErrorHandler = nil
-                    self.chatRequestID       = nil
-                    DispatchQueue.main.async { handler?("") }
+                    // Fallback cleanup — clears any handlers that lifecycle end may have missed
+                    self.chatRequestID = nil
+                    print("[OpenClawWS] chat.final received")
                 }
 
             case "health", "tick":
@@ -1193,7 +1219,7 @@ struct ChatView: View {
 
                     if state.settingsPanelVisible {
                         Divider().background(Color.white.opacity(0.08))
-                        AgentSettingsPanel(agent: $agent).environmentObject(state)
+                        AgentSettingsPanel(agent: $agent).environmentObject(state).environmentObject(avatarService)
                             .frame(width: 290)
                             .transition(.move(edge: .trailing).combined(with: .opacity))
                     }
@@ -1335,14 +1361,6 @@ struct AvatarPopoverView: View {
     @State private var didStarSave = false
 
     private let historySize: CGFloat = 44
-    private let gradientColors: [Color] = [
-        Color(red: 1.0,  green: 0.55, blue: 0.10),
-        Color(red: 1.0,  green: 0.25, blue: 0.55),
-        Color(red: 0.95, green: 0.15, blue: 0.65),
-        Color(red: 0.30, green: 0.55, blue: 1.00),
-        Color(red: 0.40, green: 0.78, blue: 1.00),
-    ]
-
     var body: some View {
         let avatarImage: CGImage? = avatarService.avatarImages[agent.id]
         let isGenerating: Bool    = avatarService.generatingAgents.contains(agent.id)
@@ -1420,11 +1438,11 @@ struct AvatarPopoverView: View {
                                             if isSelected {
                                                 Circle()
                                                     .strokeBorder(
-                                                        AngularGradient(colors: gradientColors, center: .center),
+                                                        Color(red: 1.0, green: 0.25, blue: 0.55),
                                                         lineWidth: 2.5
                                                     )
                                                     .frame(width: historySize, height: historySize)
-                                                    .shadow(color: Color(red: 0.95, green: 0.15, blue: 0.65).opacity(0.5), radius: 4)
+                                                    .shadow(color: Color(red: 1.0, green: 0.25, blue: 0.55).opacity(0.5), radius: 4)
                                             } else {
                                                 Circle()
                                                     .strokeBorder(Color.white.opacity(0.15), lineWidth: 1)
@@ -1438,6 +1456,19 @@ struct AvatarPopoverView: View {
                         }
                     }
                     Spacer()
+                }
+
+                HStack(spacing: 8) {
+                    Text("Avatar generation")
+                        .font(.system(size: 12)).foregroundColor(.white)
+                    Toggle("", isOn: Binding(
+                        get: { avatarService.isGenerationEnabled(for: agent.id) },
+                        set: { avatarService.setGeneration(enabled: $0, for: agent.id) }
+                    ))
+                    .toggleStyle(.switch)
+                    .tint(Color(red: 1.0, green: 0.25, blue: 0.55))
+                    .scaleEffect(0.75)
+                    .frame(width: 40)
                 }
 
                 VStack(alignment: .leading, spacing: 5) {
@@ -2309,6 +2340,7 @@ struct HeartbeatEditorView: View {
 struct AgentSettingsPanel: View {
     @Binding var agent: Agent
     @EnvironmentObject var state: AppState
+    @EnvironmentObject var avatarService: AgentAvatarService
 
     var body: some View {
         ZStack {
@@ -2334,6 +2366,27 @@ struct AgentSettingsPanel: View {
                             .padding(.horizontal, 10).padding(.vertical, 8)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .glassBackground(opacity: 0.08, cornerRadius: 8, borderOpacity: 0.12)
+                    }
+
+                    VStack(alignment: .leading, spacing: 6) {
+                        Label("Avatar Generation", systemImage: "photo.sparkles")
+                            .font(.system(size: 11, weight: .medium)).foregroundColor(Color.white.opacity(0.5))
+                        HStack {
+                            Text("Avatar generation")
+                                .font(.system(size: 12)).foregroundColor(.white)
+                            Spacer()
+                            Toggle("", isOn: Binding(
+                                get: { avatarService.isGenerationEnabled(for: agent.id) },
+                                set: { avatarService.setGeneration(enabled: $0, for: agent.id) }
+                            ))
+                            .toggleStyle(.switch)
+                            .tint(Color(red: 1.0, green: 0.25, blue: 0.55))
+                            .scaleEffect(0.75)
+                            .frame(width: 40)
+                        }
+                        .padding(.horizontal, 10).padding(.vertical, 8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .glassBackground(opacity: 0.08, cornerRadius: 8, borderOpacity: 0.12)
                     }
 
                     PersonalityMatrixView(agent: $agent).environmentObject(state)

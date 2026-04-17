@@ -1,23 +1,29 @@
 // WebSocketManagerTests.swift
 // AgenticsTests
 //
-// Tests for the token stream routing logic in OpenClawWebSocket.
-// Proves that the single-handler design prevents token mixing between agents.
+// Tests for the session-keyed token routing logic in OpenClawWebSocket.
+// Proves that each agent's tokens are routed to the correct handler,
+// even when multiple agents are active — no token mixing.
 
 import XCTest
 @testable import Agentics
 
 final class WebSocketManagerTests: XCTestCase {
 
-    // MARK: - Helpers
+    // MARK: - Frame Helpers
+    // These helpers build JSON frames that match the real gateway format.
+    // Every agent token event includes "sessionKey" and "runId" so the
+    // router can dispatch to the correct handler.
 
-    /// Builds a fake "agent" event frame (token streaming) as a JSON string.
-    private func makeTokenFrame(delta: String) -> String {
+    /// A token streaming frame for a specific session.
+    private func makeTokenFrame(delta: String, sessionKey: String, runId: String = "run-test-123") -> String {
         return """
         {
             "type": "event",
             "event": "agent",
             "payload": {
+                "sessionKey": "\(sessionKey)",
+                "runId": "\(runId)",
                 "stream": "assistant",
                 "data": { "delta": "\(delta)" }
             }
@@ -25,8 +31,26 @@ final class WebSocketManagerTests: XCTestCase {
         """
     }
 
-    /// Builds a fake "chat" event frame with state: "final" (stream complete).
-    private func makeFinalFrame() -> String {
+    /// A lifecycle frame signaling the end of a stream (this is how the
+    /// gateway tells us a response is fully done).
+    private func makeLifecycleEndFrame(sessionKey: String, runId: String = "run-test-123") -> String {
+        return """
+        {
+            "type": "event",
+            "event": "agent",
+            "payload": {
+                "sessionKey": "\(sessionKey)",
+                "runId": "\(runId)",
+                "stream": "lifecycle",
+                "data": { "phase": "end" }
+            }
+        }
+        """
+    }
+
+    /// A chat.final frame — still sent by the gateway but only used for
+    /// bookkeeping, not for calling completion handlers.
+    private func makeChatFinalFrame() -> String {
         return """
         {
             "type": "event",
@@ -43,7 +67,7 @@ final class WebSocketManagerTests: XCTestCase {
 
     // MARK: - Tests
 
-    /// THE CORE TEST: Tokens only go to the agent that sent the last message.
+    /// THE CORE TEST: Tokens only go to the agent whose sessionKey matches.
     func testTokensRouteToCorrectAgent() {
         let ws = OpenClawWebSocket(authToken: "test-token-not-real")
 
@@ -57,17 +81,17 @@ final class WebSocketManagerTests: XCTestCase {
             onError: { _ in XCTFail("Eve should not get an error") }
         )
 
-        ws.handleFrame(makeTokenFrame(delta: "Hello"))
-        ws.handleFrame(makeTokenFrame(delta: " there"))
-        ws.handleFrame(makeTokenFrame(delta: "!"))
+        // Frames carry sessionKey "agent:eve:main" — should go to Eve's handler
+        ws.handleFrame(makeTokenFrame(delta: "Hello",  sessionKey: "agent:eve:main"))
+        ws.handleFrame(makeTokenFrame(delta: " there", sessionKey: "agent:eve:main"))
+        ws.handleFrame(makeTokenFrame(delta: "!",      sessionKey: "agent:eve:main"))
 
         drainMainQueue()
 
         XCTAssertEqual(eveTokens, ["Hello", " there", "!"],
-                        "Eve should receive all tokens from her stream")
-
+                       "Eve should receive all tokens from her stream")
         XCTAssertTrue(orionTokens.isEmpty,
-                      "Orion should receive zero tokens — he didn't send anything")
+                      "Orion should receive zero tokens — he never sent a message")
     }
 
     /// After Eve's stream completes, sending as Orion should route
@@ -85,8 +109,8 @@ final class WebSocketManagerTests: XCTestCase {
             onError: { _ in XCTFail("Eve error") }
         )
 
-        ws.handleFrame(makeTokenFrame(delta: "Eve reply"))
-        ws.handleFrame(makeFinalFrame())
+        ws.handleFrame(makeTokenFrame(delta: "Eve reply", sessionKey: "agent:eve:main"))
+        ws.handleFrame(makeLifecycleEndFrame(sessionKey: "agent:eve:main"))
 
         drainMainQueue()
 
@@ -97,12 +121,12 @@ final class WebSocketManagerTests: XCTestCase {
             onError: { _ in XCTFail("Orion error") }
         )
 
-        ws.handleFrame(makeTokenFrame(delta: "Orion reply"))
+        ws.handleFrame(makeTokenFrame(delta: "Orion reply", sessionKey: "agent:orion:main"))
 
         drainMainQueue()
 
         XCTAssertTrue(eveTokens.contains("Eve reply"),
-                      "Eve should have received her token")
+                      "Eve should have received her token before the stream ended")
         XCTAssertEqual(orionTokens, ["Orion reply"],
                        "Orion should receive only his own tokens")
     }
@@ -111,13 +135,15 @@ final class WebSocketManagerTests: XCTestCase {
     func testTokensWithNoHandlerDoNotCrash() {
         let ws = OpenClawWebSocket(authToken: "test-token-not-real")
 
-        ws.handleFrame(makeTokenFrame(delta: "orphan token"))
-        ws.handleFrame(makeFinalFrame())
+        // No call to send() — no handlers registered — should be a silent no-op
+        ws.handleFrame(makeTokenFrame(delta: "orphan token", sessionKey: "agent:nobody:main"))
+        ws.handleFrame(makeLifecycleEndFrame(sessionKey: "agent:nobody:main"))
 
         drainMainQueue()
+        // If we get here without crashing, the test passes
     }
 
-    /// The pending agent ID should be set after send().
+    /// The pending agent ID should be set immediately after send().
     func testPendingAgentIDSetAfterSend() {
         let ws = OpenClawWebSocket(authToken: "test-token-not-real")
 
@@ -129,15 +155,15 @@ final class WebSocketManagerTests: XCTestCase {
         )
 
         XCTAssertEqual(ws.pendingAgentID, "eve",
-                       "pendingAgentID should be 'eve' after sending as Eve")
+                       "pendingAgentID should be 'eve' right after send()")
     }
 
-    /// Overwriting the handler mid-stream should route new tokens to the new handler.
-    func testOverwriteHandlerMidStream() {
+    /// Two concurrent agents should each get only their own tokens.
+    func testTwoAgentsConcurrentStreams() {
         let ws = OpenClawWebSocket(authToken: "test-token-not-real")
 
-        var eveTokens:   [String] = []
-        var novaTokens:  [String] = []
+        var eveTokens:  [String] = []
+        var novaTokens: [String] = []
 
         ws.send(
             message: "Eve message",
@@ -146,10 +172,6 @@ final class WebSocketManagerTests: XCTestCase {
             onError: { _ in }
         )
 
-        ws.handleFrame(makeTokenFrame(delta: "first"))
-
-        drainMainQueue()
-
         ws.send(
             message: "Nova message",
             agentID: "nova",
@@ -157,14 +179,44 @@ final class WebSocketManagerTests: XCTestCase {
             onError: { _ in }
         )
 
-        ws.handleFrame(makeTokenFrame(delta: "second"))
+        // Interleaved frames from two different sessions
+        ws.handleFrame(makeTokenFrame(delta: "eve-1",  sessionKey: "agent:eve:main",  runId: "run-eve"))
+        ws.handleFrame(makeTokenFrame(delta: "nova-1", sessionKey: "agent:nova:main", runId: "run-nova"))
+        ws.handleFrame(makeTokenFrame(delta: "eve-2",  sessionKey: "agent:eve:main",  runId: "run-eve"))
+        ws.handleFrame(makeTokenFrame(delta: "nova-2", sessionKey: "agent:nova:main", runId: "run-nova"))
 
         drainMainQueue()
 
-        XCTAssertEqual(eveTokens, ["first"],
-                       "Eve should only have the token before handler was overwritten")
-        XCTAssertEqual(novaTokens, ["second"],
-                       "Nova should get tokens after her send() overwrote the handler")
+        XCTAssertEqual(eveTokens,  ["eve-1",  "eve-2"],  "Eve should get exactly her two tokens")
+        XCTAssertEqual(novaTokens, ["nova-1", "nova-2"], "Nova should get exactly her two tokens")
+    }
+
+    /// A lifecycle:end frame should remove the handler so future orphan
+    /// tokens for that session produce no output.
+    func testLifecycleEndClearsHandler() {
+        let ws = OpenClawWebSocket(authToken: "test-token-not-real")
+
+        var tokens: [String] = []
+
+        ws.send(
+            message: "test",
+            agentID: "eve",
+            onToken: { token in tokens.append(token) },
+            onError: { _ in }
+        )
+
+        ws.handleFrame(makeTokenFrame(delta: "before end", sessionKey: "agent:eve:main"))
+        ws.handleFrame(makeLifecycleEndFrame(sessionKey: "agent:eve:main"))
+
+        drainMainQueue()
+
+        // After lifecycle:end the handler is gone — stale tokens must be ignored
+        ws.handleFrame(makeTokenFrame(delta: "after end", sessionKey: "agent:eve:main"))
+
+        drainMainQueue()
+
+        XCTAssertEqual(tokens, ["before end"],
+                       "Tokens arriving after lifecycle:end should be silently dropped")
     }
 
     /// Unparseable frames should not crash or route to any handler.
@@ -187,7 +239,6 @@ final class WebSocketManagerTests: XCTestCase {
         drainMainQueue()
 
         XCTAssertTrue(tokens.isEmpty,
-                      "Unparseable frames should not produce tokens")
+                      "Unparseable frames should not produce any tokens")
     }
 }
-
