@@ -1,0 +1,25 @@
+# Xcode build output
+DerivedData/
+build/
+*.xcarchive
+
+# Xcode user settings (machine-specific, not needed by others)
+*.xcuserstate
+xcuserdata/
+
+# macOS junk files
+.DS_Store
+**/.DS_Store
+
+# API keys and secrets — never commit these
+.env
+*.env
+auth-profiles.json
+openclaw.json
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# CocoaPods (if ever added)
+Pods/

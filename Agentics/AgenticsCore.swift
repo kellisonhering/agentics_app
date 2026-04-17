@@ -551,30 +551,54 @@ class OpenClawLoader {
     func writeGatewayToken(_ token: String, configPath: String) -> Bool {
         let expandedPath = (configPath as NSString).expandingTildeInPath
         guard let data = FileManager.default.contents(atPath: expandedPath),
-              var rawJson = String(data: data, encoding: .utf8) else { return false }
-
-        let pattern = "\"token\":\\s*\"[^\"]*\""
-        guard let regex = try? NSRegularExpression(pattern: pattern),
-              let match = regex.firstMatch(in: rawJson, range: NSRange(rawJson.startIndex..., in: rawJson)),
-              let swiftRange = Range(match.range, in: rawJson) else { return false }
-
-        // Find the match that's inside gateway.auth (not inside agents)
-        // We look for the one preceded by "mode": "token" nearby
-        let matches = regex.matches(in: rawJson, range: NSRange(rawJson.startIndex..., in: rawJson))
-        for m in matches {
-            guard let r = Range(m.range, in: rawJson) else { continue }
-            let before = rawJson[rawJson.startIndex..<r.lowerBound]
-            // Check if this token field is inside gateway.auth by looking for "mode" nearby
-            if before.contains("\"mode\": \"token\"") || before.contains("\"mode\":\"token\"") {
-                rawJson.replaceSubrange(r, with: "\"token\": \"\(token)\"")
-                do {
-                    try rawJson.write(toFile: expandedPath, atomically: true, encoding: .utf8)
-                    return true
-                } catch { return false }
-            }
-        }
-        return false
+              var json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              var gateway = json["gateway"] as? [String: Any],
+              var auth = gateway["auth"] as? [String: Any] else { return false }
+        auth["token"] = token
+        gateway["auth"] = auth
+        json["gateway"] = gateway
+        guard let newData = try? JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys]) else { return false }
+        do { try newData.write(to: URL(fileURLWithPath: expandedPath), options: .atomic); return true }
+        catch { print("[KeyStore] Failed to write gateway token: \(error)"); return false }
     }
+
+    // MARK: - .env File (global API keys for all agents)
+
+    var dotEnvPath: String = ("~/.openclaw/.env" as NSString).expandingTildeInPath
+
+    private func readDotEnv() -> [String: String] {
+        guard let contents = try? String(contentsOfFile: dotEnvPath, encoding: .utf8) else { return [:] }
+        var result: [String: String] = [:]
+        for line in contents.components(separatedBy: .newlines) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.isEmpty, !trimmed.hasPrefix("#"), let eq = trimmed.firstIndex(of: "=") else { continue }
+            let key = String(trimmed[trimmed.startIndex..<eq])
+            let value = String(trimmed[trimmed.index(after: eq)...])
+            result[key] = value
+        }
+        return result
+    }
+
+    private func writeDotEnv(_ values: [String: String]) -> Bool {
+        var existing = readDotEnv()
+        for (k, v) in values { existing[k] = v }
+        let contents = existing.map { "\($0.key)=\($0.value)" }.sorted().joined(separator: "\n") + "\n"
+        do { try contents.write(toFile: dotEnvPath, atomically: true, encoding: .utf8); return true }
+        catch { print("[KeyStore] Failed to write .env: \(error)"); return false }
+    }
+
+    func readEnvKey(_ name: String) -> String? {
+        let value = readDotEnv()[name]
+        return value?.isEmpty == false ? value : nil
+    }
+
+    func writeEnvKeys(_ keys: [String: String]) -> Bool {
+        writeDotEnv(keys)
+    }
+
+    func readGeminiKey() -> String? { readEnvKey("GOOGLE_API_KEY") }
+    func readAnthropicKey() -> String? { readEnvKey("ANTHROPIC_API_KEY") }
+    func readOpenAIKey() -> String? { readEnvKey("OPENAI_API_KEY") }
 
     func chatJSONPath(for agent: AgentConfig, defaults: AgentDefaults) -> String {
         let workspace = workspacePath(for: agent, defaults: defaults)
@@ -788,7 +812,7 @@ class AppState: ObservableObject {
     @Published var configPath: String = "~/.openclaw/openclaw.json"
     @Published var loadError: String? = nil
     @Published var isLoaded: Bool = false
-    @Published var settingsPanelVisible: Bool = false
+    @Published var settingsPanelVisible: Bool = true
     @Published var streamingAgents: Set<String> = []
     let wsManager = OpenClawWebSocket()
 
@@ -903,15 +927,17 @@ class AppState: ObservableObject {
 
 struct ContentView: View {
     @StateObject var state = AppState()
+    @StateObject var avatarService = AgentAvatarService()
     @State private var showAPIKeyManager = false
 
     var body: some View {
         NavigationSplitView {
-            SidebarView().environmentObject(state)
+            SidebarView().environmentObject(state).environmentObject(avatarService)
         } detail: {
             if let agent = state.selectedAgent {
                 ChatView(agent: binding(for: agent))
                     .environmentObject(state)
+                    .environmentObject(avatarService)
                     .id(agent.id)
             } else {
                 EmptyStateView().environmentObject(state)
@@ -925,6 +951,9 @@ struct ContentView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .showAPIKeyManager)) { _ in
             showAPIKeyManager = true
+        }
+        .task {
+            await avatarService.loadAll(agents: state.agents)
         }
     }
 
@@ -950,7 +979,7 @@ struct SidebarView: View {
 
     var body: some View {
         ZStack {
-            Color(red: 0.06, green: 0.06, blue: 0.10).ignoresSafeArea()
+            Color(red: 0.14, green: 0.14, blue: 0.14).ignoresSafeArea()
             VStack(spacing: 0) {
                 HStack {
                     Text("Agentics")
@@ -959,7 +988,7 @@ struct SidebarView: View {
                     Spacer()
                     Button(action: { state.loadAgents() }) {
                         Image(systemName: "arrow.clockwise")
-                            .foregroundColor(.blue)
+                            .foregroundColor(Color(red: 1.0, green: 0.25, blue: 0.55))
                             .font(.system(size: 15))
                     }
                     .buttonStyle(.plain)
@@ -1001,8 +1030,6 @@ struct SidebarView: View {
                         }
                     }
                 }
-
-
             }
         }
         .frame(minWidth: 260, maxWidth: 300)
@@ -1012,25 +1039,35 @@ struct SidebarView: View {
 struct AgentRowView: View {
     let agent: Agent
     @EnvironmentObject var state: AppState
+    @EnvironmentObject var avatarService: AgentAvatarService
     var isSelected: Bool { state.selectedAgent?.id == agent.id }
-    // Read status live from AppState so the dot updates in real time
     var liveStatus: AgentStatus { state.agents.first(where: { $0.id == agent.id })?.status ?? agent.status }
 
     var body: some View {
+        let avatarImage: CGImage? = avatarService.avatarImages[agent.id]
         HStack(spacing: 12) {
             ZStack(alignment: .bottomTrailing) {
-                Circle()
-                    .fill(agent.avatarColor.opacity(0.15))
-                    .frame(width: 46, height: 46)
-                    .overlay(Circle().stroke(agent.avatarColor.opacity(0.3), lineWidth: 1))
-                    .overlay(
-                        Text(String(agent.name.prefix(1)))
-                            .font(.system(size: 18, weight: .semibold, design: .rounded))
-                            .foregroundColor(agent.avatarColor)
-                    )
+                if let cgImage = avatarImage {
+                    Image(cgImage, scale: 1.0, label: Text(agent.name))
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: 46, height: 46)
+                        .clipShape(Circle())
+                        .overlay(Circle().stroke(agent.avatarColor.opacity(0.3), lineWidth: 1))
+                } else {
+                    Circle()
+                        .fill(agent.avatarColor.opacity(0.15))
+                        .frame(width: 46, height: 46)
+                        .overlay(Circle().stroke(agent.avatarColor.opacity(0.3), lineWidth: 1))
+                        .overlay(
+                            Text(String(agent.name.prefix(1)))
+                                .font(.system(size: 18, weight: .semibold, design: .rounded))
+                                .foregroundColor(agent.avatarColor)
+                        )
+                }
                 AgentStatusDot(status: liveStatus, size: 11)
                     .id(liveStatus)
-                    .overlay(Circle().stroke(Color(red: 0.06, green: 0.06, blue: 0.10), lineWidth: 2))
+                    .overlay(Circle().stroke(Color(red: 0.14, green: 0.14, blue: 0.14), lineWidth: 2))
             }
 
             VStack(alignment: .leading, spacing: 3) {
@@ -1058,15 +1095,15 @@ struct AgentRowView: View {
                         Text("\(agent.unreadCount)")
                             .font(.system(size: 11, weight: .bold)).foregroundColor(.white)
                             .padding(.horizontal, 6).padding(.vertical, 2)
-                            .background(Color.blue).clipShape(Capsule())
+                            .background(Color(red: 1.0, green: 0.25, blue: 0.55)).clipShape(Capsule())
                     }
                 }
             }
         }
         .padding(.horizontal, 14).padding(.vertical, 10)
-        .background(isSelected ? Color.blue.opacity(0.12) : Color.clear)
+        .background(isSelected ? Color(red: 1.0, green: 0.25, blue: 0.55).opacity(0.12) : Color.clear)
         .overlay(
-            isSelected ? Rectangle().fill(Color.blue.opacity(0.6))
+            isSelected ? Rectangle().fill(Color(red: 1.0, green: 0.25, blue: 0.55).opacity(0.6))
                 .frame(width: 3).frame(maxWidth: .infinity, alignment: .leading) : nil
         )
         .contentShape(Rectangle())
@@ -1079,6 +1116,7 @@ struct AgentRowView: View {
 struct ChatView: View {
     @Binding var agent: Agent
     @EnvironmentObject var state: AppState
+    @EnvironmentObject var avatarService: AgentAvatarService
     @State private var inputText = ""
     @State private var scrollProxy: ScrollViewProxy? = nil
     @State private var pendingCompact = false
@@ -1092,13 +1130,12 @@ struct ChatView: View {
 
     var body: some View {
         ZStack {
-            LinearGradient(
-                colors: [Color(red: 0.06, green: 0.06, blue: 0.12), Color(red: 0.04, green: 0.04, blue: 0.09)],
-                startPoint: .topLeading, endPoint: .bottomTrailing
-            ).ignoresSafeArea()
+            Color(red: 0.10, green: 0.10, blue: 0.10).ignoresSafeArea()
 
             VStack(spacing: 0) {
-                ChatHeaderView(agent: $agent, onCompact: compactContext).environmentObject(state)
+                ChatHeaderView(agent: $agent, onCompact: compactContext)
+                    .environmentObject(state)
+                    .environmentObject(avatarService)
                 Divider().background(Color.white.opacity(0.08))
 
                 HStack(spacing: 0) {
@@ -1151,6 +1188,7 @@ struct ChatView: View {
 
                         InputBarView(inputText: $inputText, agent: $agent, pendingCompact: $pendingCompact)
                             .environmentObject(state)
+                            .environmentObject(avatarService)
                     }
 
                     if state.settingsPanelVisible {
@@ -1169,18 +1207,67 @@ struct ChatView: View {
 struct ChatHeaderView: View {
     @Binding var agent: Agent
     @EnvironmentObject var state: AppState
+    @EnvironmentObject var avatarService: AgentAvatarService
     var onCompact: (() -> Void)? = nil
 
+    @State private var showAvatarPopover = false
+    @State private var ringShift: CGFloat = 0
+    @State private var ringOpacity: Double = 0
+    @State private var ringWidth: CGFloat = 2
+
     var body: some View {
+        let avatarImage: CGImage? = avatarService.avatarImages[agent.id]
+        let isGenerating: Bool    = avatarService.generatingAgents.contains(agent.id)
         HStack(spacing: 12) {
-            Circle()
-                .fill(agent.avatarColor.opacity(0.15)).frame(width: 36, height: 36)
-                .overlay(Circle().stroke(agent.avatarColor.opacity(0.3), lineWidth: 1))
-                .overlay(
-                    Text(String(agent.name.prefix(1)))
-                        .font(.system(size: 14, weight: .bold, design: .rounded))
-                        .foregroundColor(agent.avatarColor)
-                )
+            Button(action: { showAvatarPopover.toggle() }) {
+                ZStack {
+                    if let cgImage = avatarImage {
+                        Image(cgImage, scale: 1.0, label: Text(agent.name))
+                            .resizable()
+                            .scaledToFill()
+                            .frame(width: 56, height: 56)
+                            .clipShape(Circle())
+                    } else {
+                        Circle()
+                            .fill(agent.avatarColor.opacity(0.15))
+                            .frame(width: 56, height: 56)
+                            .overlay(
+                                Text(String(agent.name.prefix(1)))
+                                    .font(.system(size: 20, weight: .bold, design: .rounded))
+                                    .foregroundColor(agent.avatarColor)
+                            )
+                    }
+                    Circle()
+                        .strokeBorder(
+                            AngularGradient(
+                                stops: [
+                                    .init(color: Color(red: 1.0,  green: 0.55, blue: 0.10), location: max(0, min(1, 0.00 + ringShift))),
+                                    .init(color: Color(red: 1.0,  green: 0.25, blue: 0.55), location: max(0, min(1, 0.25 + ringShift))),
+                                    .init(color: Color(red: 0.95, green: 0.15, blue: 0.65), location: max(0, min(1, 0.50 + ringShift))),
+                                    .init(color: Color(red: 0.30, green: 0.55, blue: 1.00), location: max(0, min(1, 0.75 + ringShift))),
+                                    .init(color: Color(red: 0.40, green: 0.78, blue: 1.00), location: max(0, min(1, 1.00 + ringShift))),
+                                ],
+                                center: .center
+                            ),
+                            lineWidth: ringWidth
+                        )
+                        .frame(width: 56, height: 56)
+                        .opacity(ringOpacity)
+                        .shadow(color: Color(red: 0.95, green: 0.15, blue: 0.65).opacity(0.5), radius: 4)
+                        .shadow(color: Color(red: 0.40, green: 0.78, blue: 1.00).opacity(0.4), radius: 6)
+                        .allowsHitTesting(false)
+                }
+            }
+            .buttonStyle(.plain)
+            .help("Edit avatar DNA")
+            .popover(isPresented: $showAvatarPopover, arrowEdge: .bottom) {
+                AvatarPopoverView(agent: $agent)
+                    .environmentObject(state)
+                    .environmentObject(avatarService)
+            }
+            .onChange(of: isGenerating) { generating in
+                if generating { startPulse() } else { flashOnArrival() }
+            }
 
             VStack(alignment: .leading, spacing: 1) {
                 Text(agent.name).font(.system(size: 14, weight: .semibold)).foregroundColor(.white)
@@ -1210,14 +1297,214 @@ struct ChatHeaderView: View {
             Button(action: { withAnimation { state.settingsPanelVisible.toggle() } }) {
                 Image(systemName: "slider.horizontal.3")
                     .font(.system(size: 15))
-                    .foregroundColor(state.settingsPanelVisible ? .blue : Color.white.opacity(0.5))
+                    .foregroundColor(state.settingsPanelVisible ? Color(red: 1.0, green: 0.25, blue: 0.55) : Color.white.opacity(0.5))
                     .padding(7)
                     .glassBackground(opacity: state.settingsPanelVisible ? 0.2 : 0.08, cornerRadius: 8, borderOpacity: 0.15)
             }
             .buttonStyle(.plain).padding(.leading, 4)
         }
-        .padding(.horizontal, 18).padding(.vertical, 12)
+        .padding(.horizontal, 18).padding(.vertical, 8)
         .background(.ultraThinMaterial)
+    }
+
+    private func startPulse() {
+        ringWidth   = 2
+        ringOpacity = 0
+        withAnimation(.easeIn(duration: 0.3)) { ringOpacity = 0.85 }
+        withAnimation(.linear(duration: 2.0).repeatForever(autoreverses: false)) { ringShift = 1.0 }
+    }
+
+    private func flashOnArrival() {
+        withAnimation(.easeOut(duration: 0.15)) { ringWidth = 3.5; ringOpacity = 1.0 }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            withAnimation(.easeOut(duration: 0.6)) { ringWidth = 2; ringOpacity = 0 }
+            ringShift = 0
+        }
+    }
+}
+
+// MARK: - Avatar Popover
+
+struct AvatarPopoverView: View {
+    @Binding var agent: Agent
+    @EnvironmentObject var state: AppState
+    @EnvironmentObject var avatarService: AgentAvatarService
+
+    @State private var dnaText: String = ""
+    @State private var didSave = false
+    @State private var didStarSave = false
+
+    private let historySize: CGFloat = 44
+    private let gradientColors: [Color] = [
+        Color(red: 1.0,  green: 0.55, blue: 0.10),
+        Color(red: 1.0,  green: 0.25, blue: 0.55),
+        Color(red: 0.95, green: 0.15, blue: 0.65),
+        Color(red: 0.30, green: 0.55, blue: 1.00),
+        Color(red: 0.40, green: 0.78, blue: 1.00),
+    ]
+
+    var body: some View {
+        let avatarImage: CGImage? = avatarService.avatarImages[agent.id]
+        let isGenerating: Bool    = avatarService.generatingAgents.contains(agent.id)
+        let history: [CGImage]    = avatarService.avatarHistory[agent.id] ?? []
+        let selectedIdx: Int      = avatarService.selectedHistoryIndex[agent.id] ?? 0
+        let workspacePath: String = (agent.workspacePath as NSString).expandingTildeInPath
+
+        ZStack {
+            Color(red: 0.14, green: 0.14, blue: 0.14).ignoresSafeArea()
+            VStack(alignment: .leading, spacing: 14) {
+
+                // Main avatar preview + star button
+                HStack {
+                    Spacer()
+                    VStack(spacing: 10) {
+                        ZStack {
+                            if let cgImage = avatarImage {
+                                Image(cgImage, scale: 1.0, label: Text(agent.name))
+                                    .resizable()
+                                    .scaledToFill()
+                                    .frame(width: 120, height: 120)
+                                    .clipShape(Circle())
+                                    .overlay(Circle().stroke(agent.avatarColor.opacity(0.4), lineWidth: 1.5))
+                            } else {
+                                Circle()
+                                    .fill(agent.avatarColor.opacity(0.15))
+                                    .frame(width: 120, height: 120)
+                                    .overlay(Circle().stroke(agent.avatarColor.opacity(0.3), lineWidth: 1.5))
+                                    .overlay(
+                                        Text(String(agent.name.prefix(1)))
+                                            .font(.system(size: 48, weight: .semibold, design: .rounded))
+                                            .foregroundColor(agent.avatarColor)
+                                    )
+                            }
+                            if isGenerating {
+                                Circle().fill(Color.black.opacity(0.45)).frame(width: 120, height: 120)
+                                ProgressView().progressViewStyle(.circular).scaleEffect(0.8)
+                            }
+                        }
+
+                        // Star button to permanently save
+                        if avatarImage != nil {
+                            Button(action: {
+                                avatarService.savePermanently(agentId: agent.id, workspacePath: workspacePath)
+                                didStarSave = true
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 2) { didStarSave = false }
+                            }) {
+                                HStack(spacing: 4) {
+                                    Image(systemName: didStarSave ? "star.fill" : "star")
+                                        .font(.system(size: 12))
+                                        .foregroundColor(didStarSave ? Color(red: 1.0, green: 0.80, blue: 0.20) : Color.white.opacity(0.4))
+                                    Text(didStarSave ? "Saved!" : "Save permanently")
+                                        .font(.system(size: 11))
+                                        .foregroundColor(didStarSave ? Color(red: 1.0, green: 0.80, blue: 0.20) : Color.white.opacity(0.4))
+                                }
+                            }
+                            .buttonStyle(.plain)
+                        }
+
+                        // History strip — last 5 generated images
+                        if !history.isEmpty {
+                            HStack(spacing: 8) {
+                                ForEach(0..<min(history.count, 5), id: \.self) { i in
+                                    let isSelected = i == selectedIdx
+                                    Button(action: {
+                                        avatarService.selectHistory(agentId: agent.id, index: i, workspacePath: workspacePath)
+                                    }) {
+                                        ZStack {
+                                            Image(history[i], scale: 1.0, label: Text("History \(i)"))
+                                                .resizable()
+                                                .scaledToFill()
+                                                .frame(width: historySize, height: historySize)
+                                                .clipShape(Circle())
+
+                                            if isSelected {
+                                                Circle()
+                                                    .strokeBorder(
+                                                        AngularGradient(colors: gradientColors, center: .center),
+                                                        lineWidth: 2.5
+                                                    )
+                                                    .frame(width: historySize, height: historySize)
+                                                    .shadow(color: Color(red: 0.95, green: 0.15, blue: 0.65).opacity(0.5), radius: 4)
+                                            } else {
+                                                Circle()
+                                                    .strokeBorder(Color.white.opacity(0.15), lineWidth: 1)
+                                                    .frame(width: historySize, height: historySize)
+                                            }
+                                        }
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                        }
+                    }
+                    Spacer()
+                }
+
+                VStack(alignment: .leading, spacing: 5) {
+                    Label("Avatar DNA", systemImage: "sparkles")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(Color.white.opacity(0.45))
+
+                    TextEditor(text: $dnaText)
+                        .font(.system(size: 12))
+                        .foregroundColor(.white)
+                        .scrollContentBackground(.hidden)
+                        .padding(8)
+                        .frame(height: 72)
+                        .glassBackground(opacity: 0.08, cornerRadius: 8, borderOpacity: 0.15)
+
+                    if let error = avatarService.lastError[agent.id] {
+                        HStack(alignment: .top, spacing: 5) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .font(.system(size: 10)).foregroundColor(.orange)
+                            Text(error)
+                                .font(.system(size: 10)).foregroundColor(.orange)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    } else {
+                        Text("Describe your agent's look. Example: \"glowing teal robot with kind eyes, friendly cartoon style\"")
+                            .font(.system(size: 10))
+                            .foregroundColor(Color.white.opacity(0.25))
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+
+                HStack {
+                    if didSave {
+                        HStack(spacing: 5) {
+                            Image(systemName: "checkmark.circle.fill").foregroundColor(.green).font(.system(size: 11))
+                            Text("Generating…").font(.system(size: 11)).foregroundColor(.green)
+                        }
+                    }
+                    Spacer()
+                    Button(action: regenerate) {
+                        HStack(spacing: 5) {
+                            Image(systemName: "arrow.triangle.2.circlepath").font(.system(size: 11))
+                            Text("Save & Regenerate").font(.system(size: 12, weight: .semibold))
+                        }
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 14).padding(.vertical, 7)
+                        .background(isGenerating ? Color.gray.opacity(0.4) : Color(red: 1.0, green: 0.25, blue: 0.55).opacity(0.7))
+                        .cornerRadius(8)
+                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.white.opacity(0.15), lineWidth: 0.5))
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(isGenerating)
+                }
+            }
+            .padding(18)
+        }
+        .frame(width: 320)
+        .preferredColorScheme(.dark)
+        .onAppear { dnaText = avatarService.agentDNA[agent.id] ?? "" }
+    }
+
+    private func regenerate() {
+        guard !avatarService.generatingAgents.contains(agent.id) else { return }
+        didSave = true
+        let messages = state.messages[agent.id] ?? []
+        avatarService.regenerate(for: agent, messages: messages, dna: dnaText)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { didSave = false }
     }
 }
 
@@ -1329,7 +1616,6 @@ struct MessageBubbleView: View {
             markdown: string,
             options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
         ) {
-            // Style links with app pink color and underline
             for run in attributed.runs {
                 if run.link != nil {
                     attributed[run.range].foregroundColor = Color(red: 1.0, green: 0.25, blue: 0.55)
@@ -1406,7 +1692,6 @@ struct BubbleShape: Shape {
     }
 }
 
-
 // MARK: - Input Bar
 
 struct AnimatedSendButton: View {
@@ -1444,11 +1729,11 @@ struct InputBarView: View {
     @Binding var agent: Agent
     @Binding var pendingCompact: Bool
     @EnvironmentObject var state: AppState
+    @EnvironmentObject var avatarService: AgentAvatarService
     @State private var pastedContent: String? = nil
 
     var isStreaming: Bool { state.streamingAgents.contains(agent.id) }
 
-    // Returns the name of a different agent that is currently streaming, if any
     var otherStreamingAgentName: String? {
         guard let streaming = state.streamingAgents.first(where: { $0 != agent.id }) else { return nil }
         return state.agents.first(where: { $0.id == streaming })?.name
@@ -1483,7 +1768,7 @@ struct InputBarView: View {
                 HStack(spacing: 8) {
                     Image(systemName: "doc.text.fill")
                         .font(.system(size: 11))
-                        .foregroundColor(.blue)
+                        .foregroundColor(Color(red: 1.0, green: 0.25, blue: 0.55))
                     Text("Pasted text • \(lineCount) lines")
                         .font(.system(size: 12, weight: .medium))
                         .foregroundColor(Color.white.opacity(0.7))
@@ -1652,6 +1937,8 @@ struct InputBarView: View {
                     updateUIForCompletion()
                     if let agent = self.state.agents.first(where: { $0.id == agentId }) {
                         self.state.saveChat(for: agent)
+                        let allMessages = self.state.messages[agentId] ?? []
+                        self.avatarService.didReceiveMessage(for: agent, messages: allMessages)
                     }
                     continuation.resume()
                 }
@@ -1717,7 +2004,6 @@ struct TypingIndicator: View {
 
 // MARK: - Personality Matrix
 
-// Reusable markdown file editor sheet
 struct MarkdownEditorSheet: View {
     let title: String
     let filePath: String
@@ -1753,7 +2039,7 @@ struct MarkdownEditorSheet: View {
 
     var body: some View {
         ZStack {
-            Color(red: 0.06, green: 0.06, blue: 0.12).ignoresSafeArea()
+            Color(red: 0.14, green: 0.14, blue: 0.14).ignoresSafeArea()
             VStack(alignment: .leading, spacing: 16) {
                 HStack {
                     Label(title, systemImage: "cpu")
@@ -1768,7 +2054,7 @@ struct MarkdownEditorSheet: View {
                     Button("Save") { saveChanges() }
                         .font(.system(size: 13, weight: .semibold)).foregroundColor(.white)
                         .padding(.horizontal, 14).padding(.vertical, 6)
-                        .background(hasChanges ? Color.blue.opacity(0.8) : Color.white.opacity(0.1))
+                        .background(hasChanges ? Color(red: 1.0, green: 0.25, blue: 0.55).opacity(0.8) : Color.white.opacity(0.1))
                         .cornerRadius(8).overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.white.opacity(0.15), lineWidth: 0.5))
                         .buttonStyle(.plain).disabled(!hasChanges)
                 }
@@ -1806,7 +2092,6 @@ struct PersonalityMatrixView: View {
                 .font(.system(size: 11, weight: .medium)).foregroundColor(Color.white.opacity(0.5))
 
             VStack(alignment: .leading, spacing: 6) {
-                // Identity row
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Agent Identity")
@@ -1818,13 +2103,12 @@ struct PersonalityMatrixView: View {
                     Spacer()
                     Button(action: { showIdentityEditor = true }) {
                         Label(agent.identityMDFound ? "Edit" : "Create", systemImage: agent.identityMDFound ? "pencil" : "plus")
-                            .font(.system(size: 11, weight: .medium)).foregroundColor(.blue)
+                            .font(.system(size: 11, weight: .medium)).foregroundColor(Color(red: 1.0, green: 0.25, blue: 0.55))
                     }.buttonStyle(.plain)
                 }
                 .padding(.horizontal, 10).padding(.vertical, 8)
                 .glassBackground(opacity: 0.08, cornerRadius: 8, borderOpacity: 0.12)
 
-                // Soul row
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Agent Soul")
@@ -1836,7 +2120,7 @@ struct PersonalityMatrixView: View {
                     Spacer()
                     Button(action: { showSoulEditor = true }) {
                         Label(agent.soulMDFound ? "Edit" : "Create", systemImage: agent.soulMDFound ? "pencil" : "plus")
-                            .font(.system(size: 11, weight: .medium)).foregroundColor(.blue)
+                            .font(.system(size: 11, weight: .medium)).foregroundColor(Color(red: 1.0, green: 0.25, blue: 0.55))
                     }.buttonStyle(.plain)
                 }
                 .padding(.horizontal, 10).padding(.vertical, 8)
@@ -1900,10 +2184,7 @@ struct HeartbeatEditorView: View {
         let success = state.saveHeartbeatInterval(for: agent)
         guard success else { return }
 
-        // Set all agents to restarting (solid yellow)
-        for i in state.agents.indices {
-            state.agents[i].status = .restarting
-        }
+        for i in state.agents.indices { state.agents[i].status = .restarting }
         isRestarting = true
         restartFailed = false
 
@@ -1911,37 +2192,25 @@ struct HeartbeatEditorView: View {
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/usr/local/bin/openclaw")
             process.arguments = ["gateway", "restart"]
-            process.environment = [
-                "PATH": "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-                "HOME": NSHomeDirectory()
-            ]
+            var env = ProcessInfo.processInfo.environment
+            env["PATH"] = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+            env["HOME"] = NSHomeDirectory()
+            process.environment = env
             let pipe = Pipe()
             process.standardOutput = pipe
             process.standardError = pipe
-
             var restartSuccess = false
-            do {
-                try process.run()
-                process.waitUntilExit()
-                restartSuccess = process.terminationStatus == 0
-            } catch {
-                restartSuccess = false
-            }
-
+            do { try process.run(); process.waitUntilExit(); restartSuccess = process.terminationStatus == 0 }
+            catch { restartSuccess = false }
             DispatchQueue.main.async {
                 self.isRestarting = false
                 if restartSuccess {
-                    self.intervalSaved = true
-                    self.restartFailed = false
-                    for i in self.state.agents.indices {
-                        self.state.agents[i].status = .idle
-                    }
+                    self.intervalSaved = true; self.restartFailed = false
+                    for i in self.state.agents.indices { self.state.agents[i].status = .idle }
                     DispatchQueue.main.asyncAfter(deadline: .now() + 3) { self.intervalSaved = false }
                 } else {
                     self.restartFailed = true
-                    for i in self.state.agents.indices {
-                        self.state.agents[i].status = .error
-                    }
+                    for i in self.state.agents.indices { self.state.agents[i].status = .error }
                     DispatchQueue.main.asyncAfter(deadline: .now() + 5) { self.restartFailed = false }
                 }
             }
@@ -1965,10 +2234,10 @@ struct HeartbeatEditorView: View {
                                 .foregroundColor(selectedInterval == preset ? .white : Color.white.opacity(0.5))
                                 .padding(.vertical, 6)
                                 .frame(maxWidth: .infinity)
-                                .background(selectedInterval == preset ? Color.blue.opacity(0.6) : Color.white.opacity(0.06))
+                                .background(selectedInterval == preset ? Color(red: 1.0, green: 0.25, blue: 0.55).opacity(0.6) : Color.white.opacity(0.06))
                                 .cornerRadius(6)
                                 .overlay(RoundedRectangle(cornerRadius: 6).stroke(
-                                    selectedInterval == preset ? Color.blue.opacity(0.8) : Color.white.opacity(0.1),
+                                    selectedInterval == preset ? Color(red: 1.0, green: 0.25, blue: 0.55).opacity(0.8) : Color.white.opacity(0.1),
                                     lineWidth: 0.5))
                         }
                         .buttonStyle(.plain)
@@ -2007,7 +2276,7 @@ struct HeartbeatEditorView: View {
                         Text(isRestarting ? "Restarting..." : "Apply")
                             .font(.system(size: 11, weight: .semibold)).foregroundColor(.white)
                             .padding(.horizontal, 14).padding(.vertical, 5)
-                            .background(Color.blue.opacity(0.6)).cornerRadius(6)
+                            .background(Color(red: 1.0, green: 0.25, blue: 0.55).opacity(0.6)).cornerRadius(6)
                             .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.white.opacity(0.15), lineWidth: 0.5))
                     }
                     .buttonStyle(.plain)
@@ -2043,7 +2312,7 @@ struct AgentSettingsPanel: View {
 
     var body: some View {
         ZStack {
-            Color(red: 0.06, green: 0.06, blue: 0.12).ignoresSafeArea()
+            Color(red: 0.14, green: 0.14, blue: 0.14).ignoresSafeArea()
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
                     Text("Agent Settings")
@@ -2107,10 +2376,7 @@ struct EmptyStateView: View {
     @EnvironmentObject var state: AppState
     var body: some View {
         ZStack {
-            LinearGradient(
-                colors: [Color(red: 0.06, green: 0.06, blue: 0.12), Color(red: 0.04, green: 0.04, blue: 0.09)],
-                startPoint: .topLeading, endPoint: .bottomTrailing
-            ).ignoresSafeArea()
+            Color(red: 0.10, green: 0.10, blue: 0.10).ignoresSafeArea()
             VStack(spacing: 14) {
                 Image(systemName: "bubble.left.and.bubble.right")
                     .font(.system(size: 48)).foregroundColor(Color.white.opacity(0.15))
@@ -2126,7 +2392,6 @@ struct EmptyStateView: View {
     }
 }
 
-
 // MARK: - API Key Manager
 
 struct APIKeyManagerView: View {
@@ -2135,17 +2400,19 @@ struct APIKeyManagerView: View {
 
     @State private var anthropicKey: String = ""
     @State private var openAIKey: String = ""
+    @State private var geminiKey: String = ""
     @State private var gatewayToken: String = ""
     @State private var saveStatus: String? = nil
     @State private var isError: Bool = false
     @State private var anthropicRevealed: Bool = false
     @State private var openAIRevealed: Bool = false
+    @State private var geminiRevealed: Bool = false
     @State private var gatewayRevealed: Bool = false
     @State private var isRestarting: Bool = false
 
-    // Check for env variable conflicts
     var anthropicEnvConflict: Bool { ProcessInfo.processInfo.environment["ANTHROPIC_API_KEY"] != nil }
     var openAIEnvConflict: Bool { ProcessInfo.processInfo.environment["OPENAI_API_KEY"] != nil }
+    var geminiEnvConflict: Bool { ProcessInfo.processInfo.environment["GOOGLE_API_KEY"] != nil }
     var gatewayEnvConflict: Bool { ProcessInfo.processInfo.environment["OPENCLAW_GATEWAY_TOKEN"] != nil }
 
     func authenticate(completion: @escaping (Bool) -> Void) {
@@ -2155,410 +2422,205 @@ struct APIKeyManagerView: View {
             context.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, localizedReason: "Reveal API key") { success, _ in
                 DispatchQueue.main.async { completion(success) }
             }
-        } else {
-            // No biometrics available — fall back to allowing reveal
-            completion(true)
-        }
+        } else { completion(true) }
     }
 
     var body: some View {
         ZStack {
-            Color(red: 0.06, green: 0.06, blue: 0.12).ignoresSafeArea()
-            VStack(alignment: .leading, spacing: 24) {
-                HStack {
-                    Text("API Keys")
-                        .font(.system(size: 18, weight: .bold, design: .rounded))
-                        .foregroundColor(.white)
-                    Spacer()
-                    Button("Done") { dismiss() }
-                        .font(.system(size: 13))
-                        .foregroundColor(Color.white.opacity(0.5))
-                        .buttonStyle(.plain)
-                }
-
-                Text("API keys are saved to each agent's auth-profiles.json. The gateway token is saved to openclaw.json. Changes take effect the next time the gateway loads credentials.")
-                    .font(.system(size: 11))
-                    .foregroundColor(Color.white.opacity(0.35))
-                    .fixedSize(horizontal: false, vertical: true)
-
-                // Env variable conflict warning
-                if anthropicEnvConflict || openAIEnvConflict || gatewayEnvConflict {
-                    HStack(alignment: .top, spacing: 8) {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .foregroundColor(.orange)
-                            .font(.system(size: 12))
-                            .padding(.top, 1)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Environment variable conflict detected")
-                                .font(.system(size: 12, weight: .semibold))
-                                .foregroundColor(.orange)
-                            let conflicts = [
-                                anthropicEnvConflict ? "ANTHROPIC_API_KEY" : nil,
-                                openAIEnvConflict ? "OPENAI_API_KEY" : nil,
-                                gatewayEnvConflict ? "OPENCLAW_GATEWAY_TOKEN" : nil
-                            ].compactMap { $0 }
-                            Text("\(conflicts.joined(separator: " and ")) \(conflicts.count == 1 ? "is" : "are") set in your shell environment and may override the values saved here. Remove \(conflicts.count == 1 ? "it" : "them") from ~/.zshrc to avoid conflicts.")
-                                .font(.system(size: 11))
-                                .foregroundColor(Color.orange.opacity(0.8))
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                    }
-                    .padding(10)
-                    .glassBackground(opacity: 0.06, cornerRadius: 8, borderOpacity: 0.25)
-                }
-
-                // Anthropic
-                VStack(alignment: .leading, spacing: 8) {
+            Color(red: 0.14, green: 0.14, blue: 0.14).ignoresSafeArea()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 24) {
                     HStack {
-                        Label("Anthropic", systemImage: "brain")
-                            .font(.system(size: 11, weight: .medium))
+                        Text("API Keys")
+                            .font(.system(size: 18, weight: .bold, design: .rounded))
+                            .foregroundColor(.white)
+                        Spacer()
+                        Button("Done") { dismiss() }
+                            .font(.system(size: 13))
                             .foregroundColor(Color.white.opacity(0.5))
-                        if anthropicEnvConflict {
-                            Text("ENV OVERRIDE ACTIVE")
-                                .font(.system(size: 9, weight: .bold))
-                                .foregroundColor(.orange)
-                                .padding(.horizontal, 5)
-                                .padding(.vertical, 2)
-                                .background(Color.orange.opacity(0.15))
-                                .cornerRadius(4)
-                        }
+                            .buttonStyle(.plain)
                     }
-                    HStack(spacing: 8) {
-                        Group {
-                            if anthropicRevealed {
-                                TextField("sk-ant-...", text: $anthropicKey)
-                            } else {
-                                SecureField("sk-ant-...", text: $anthropicKey)
+
+                    Text("API keys are saved globally to ~/.openclaw/.env and apply to all agents. The gateway token is saved to openclaw.json. Changes take effect after restart.")
+                        .font(.system(size: 11))
+                        .foregroundColor(Color.white.opacity(0.35))
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    // Env conflict warning
+                    let conflicts = [
+                        anthropicEnvConflict ? "ANTHROPIC_API_KEY" : nil,
+                        openAIEnvConflict    ? "OPENAI_API_KEY"    : nil,
+                        geminiEnvConflict    ? "GOOGLE_API_KEY"    : nil,
+                        gatewayEnvConflict   ? "OPENCLAW_GATEWAY_TOKEN" : nil
+                    ].compactMap { $0 }
+
+                    if !conflicts.isEmpty {
+                        HStack(alignment: .top, spacing: 8) {
+                            Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.orange).font(.system(size: 12)).padding(.top, 1)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Environment variable conflict detected").font(.system(size: 12, weight: .semibold)).foregroundColor(.orange)
+                                Text("\(conflicts.joined(separator: ", ")) \(conflicts.count == 1 ? "is" : "are") set in your shell environment and may override values saved here.")
+                                    .font(.system(size: 11)).foregroundColor(Color.orange.opacity(0.8)).fixedSize(horizontal: false, vertical: true)
                             }
                         }
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 13))
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 10)
-                        .glassBackground(opacity: 0.08, cornerRadius: 8, borderOpacity: anthropicEnvConflict ? 0.4 : 0.15)
+                        .padding(10).glassBackground(opacity: 0.06, cornerRadius: 8, borderOpacity: 0.25)
+                    }
 
-                        Button(action: {
-                            if anthropicRevealed {
-                                anthropicRevealed = false
-                            } else {
+                    // Anthropic
+                    keyField(label: "Anthropic", icon: "brain", placeholder: "sk-ant-...", key: $anthropicKey, revealed: $anthropicRevealed, hasConflict: anthropicEnvConflict)
+
+                    // OpenAI
+                    keyField(label: "OpenAI", icon: "sparkles", placeholder: "sk-proj-...", key: $openAIKey, revealed: $openAIRevealed, hasConflict: openAIEnvConflict)
+
+                    // Gemini
+                    keyField(label: "Gemini (Avatar Generation)", icon: "camera.filters", placeholder: "AIza...", key: $geminiKey, revealed: $geminiRevealed, hasConflict: geminiEnvConflict)
+
+                    // Gateway Token
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Label("Gateway Token", systemImage: "lock.shield").font(.system(size: 11, weight: .medium)).foregroundColor(Color.white.opacity(0.5))
+                            if gatewayEnvConflict {
+                                Text("ENV OVERRIDE ACTIVE").font(.system(size: 9, weight: .bold)).foregroundColor(.orange)
+                                    .padding(.horizontal, 5).padding(.vertical, 2).background(Color.orange.opacity(0.15)).cornerRadius(4)
+                            }
+                        }
+                        HStack(spacing: 8) {
+                            Group {
+                                if gatewayRevealed { TextField("Gateway auth token...", text: $gatewayToken) }
+                                else { SecureField("Gateway auth token...", text: $gatewayToken) }
+                            }
+                            .textFieldStyle(.plain).font(.system(size: 13)).foregroundColor(.white)
+                            .padding(.horizontal, 12).padding(.vertical, 10)
+                            .glassBackground(opacity: 0.08, cornerRadius: 8, borderOpacity: gatewayEnvConflict ? 0.4 : 0.15)
+
+                            Button(action: { if gatewayRevealed { gatewayRevealed = false } else { authenticate { if $0 { gatewayRevealed = true } } } }) {
+                                Image(systemName: gatewayRevealed ? "eye.slash" : "eye").font(.system(size: 13)).foregroundColor(Color.white.opacity(0.4))
+                                    .frame(width: 32, height: 32).glassBackground(opacity: 0.08, cornerRadius: 8, borderOpacity: 0.12)
+                            }.buttonStyle(.plain).help(gatewayRevealed ? "Hide token" : "Reveal token with Touch ID")
+
+                            Button(action: {
                                 authenticate { success in
-                                    if success { anthropicRevealed = true }
+                                    guard success else { return }
+                                    var bytes = [UInt8](repeating: 0, count: 24)
+                                    _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+                                    gatewayToken = bytes.map { String(format: "%02x", $0) }.joined()
+                                    gatewayRevealed = true
                                 }
-                            }
-                        }) {
-                            Image(systemName: anthropicRevealed ? "eye.slash" : "eye")
-                                .font(.system(size: 13))
-                                .foregroundColor(Color.white.opacity(0.4))
-                                .frame(width: 32, height: 32)
-                                .glassBackground(opacity: 0.08, cornerRadius: 8, borderOpacity: 0.12)
-                        }
-                        .buttonStyle(.plain)
-                        .help(anthropicRevealed ? "Hide key" : "Reveal key with Touch ID")
-                    }
-                }
-
-                // OpenAI
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        Label("OpenAI", systemImage: "sparkles")
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundColor(Color.white.opacity(0.5))
-                        if openAIEnvConflict {
-                            Text("ENV OVERRIDE ACTIVE")
-                                .font(.system(size: 9, weight: .bold))
-                                .foregroundColor(.orange)
-                                .padding(.horizontal, 5)
-                                .padding(.vertical, 2)
-                                .background(Color.orange.opacity(0.15))
-                                .cornerRadius(4)
+                            }) {
+                                Image(systemName: "arrow.triangle.2.circlepath").font(.system(size: 13)).foregroundColor(Color.white.opacity(0.4))
+                                    .frame(width: 32, height: 32).glassBackground(opacity: 0.08, cornerRadius: 8, borderOpacity: 0.12)
+                            }.buttonStyle(.plain).help("Generate new token")
                         }
                     }
-                    HStack(spacing: 8) {
-                        Group {
-                            if openAIRevealed {
-                                TextField("sk-proj-...", text: $openAIKey)
-                            } else {
-                                SecureField("sk-proj-...", text: $openAIKey)
-                            }
-                        }
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 13))
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 10)
-                        .glassBackground(opacity: 0.08, cornerRadius: 8, borderOpacity: openAIEnvConflict ? 0.4 : 0.15)
 
-                        Button(action: {
-                            if openAIRevealed {
-                                openAIRevealed = false
-                            } else {
-                                authenticate { success in
-                                    if success { openAIRevealed = true }
-                                }
-                            }
-                        }) {
-                            Image(systemName: openAIRevealed ? "eye.slash" : "eye")
-                                .font(.system(size: 13))
-                                .foregroundColor(Color.white.opacity(0.4))
-                                .frame(width: 32, height: 32)
-                                .glassBackground(opacity: 0.08, cornerRadius: 8, borderOpacity: 0.12)
-                        }
-                        .buttonStyle(.plain)
-                        .help(openAIRevealed ? "Hide key" : "Reveal key with Touch ID")
-                    }
-                }
-
-                // Gateway Token
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        Label("Gateway Token", systemImage: "lock.shield")
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundColor(Color.white.opacity(0.5))
-                        if gatewayEnvConflict {
-                            Text("ENV OVERRIDE ACTIVE")
-                                .font(.system(size: 9, weight: .bold))
-                                .foregroundColor(.orange)
-                                .padding(.horizontal, 5)
-                                .padding(.vertical, 2)
-                                .background(Color.orange.opacity(0.15))
-                                .cornerRadius(4)
-                        }
-                    }
-                    HStack(spacing: 8) {
-                        Group {
-                            if gatewayRevealed {
-                                TextField("Gateway auth token...", text: $gatewayToken)
-                            } else {
-                                SecureField("Gateway auth token...", text: $gatewayToken)
-                            }
-                        }
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 13))
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 10)
-                        .glassBackground(opacity: 0.08, cornerRadius: 8, borderOpacity: gatewayEnvConflict ? 0.4 : 0.15)
-
-                        Button(action: {
-                            if gatewayRevealed {
-                                gatewayRevealed = false
-                            } else {
-                                authenticate { success in
-                                    if success { gatewayRevealed = true }
-                                }
-                            }
-                        }) {
-                            Image(systemName: gatewayRevealed ? "eye.slash" : "eye")
-                                .font(.system(size: 13))
-                                .foregroundColor(Color.white.opacity(0.4))
-                                .frame(width: 32, height: 32)
-                                .glassBackground(opacity: 0.08, cornerRadius: 8, borderOpacity: 0.12)
-                        }
-                        .buttonStyle(.plain)
-                        .help(gatewayRevealed ? "Hide token" : "Reveal token with Touch ID")
-
-                        Button(action: {
-                            var bytes = [UInt8](repeating: 0, count: 24)
-                            _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
-                            gatewayToken = bytes.map { String(format: "%02x", $0) }.joined()
-                            gatewayRevealed = true
-                        }) {
-                            Image(systemName: "arrow.triangle.2.circlepath")
-                                .font(.system(size: 13))
-                                .foregroundColor(Color.white.opacity(0.4))
-                                .frame(width: 32, height: 32)
-                                .glassBackground(opacity: 0.08, cornerRadius: 8, borderOpacity: 0.12)
-                        }
-                        .buttonStyle(.plain)
-                        .help("Generate new token")
-                    }
-                }
-
-                if let status = saveStatus {
-                    HStack(spacing: 6) {
-                        Image(systemName: isError ? "xmark.circle.fill" : "checkmark.circle.fill")
-                            .foregroundColor(isError ? .red : .green)
-                            .font(.system(size: 12))
-                        Text(status)
-                            .font(.system(size: 12))
-                            .foregroundColor(isError ? .red : .green)
-                    }
-                }
-
-                HStack {
-                    Spacer()
-                    Button(action: saveKeys) {
+                    if let status = saveStatus {
                         HStack(spacing: 6) {
-                            if isRestarting {
-                                ProgressView()
-                                    .scaleEffect(0.6)
-                                    .frame(width: 12, height: 12)
-                            }
-                            Text(isRestarting ? "Restarting..." : "Save Keys")
-                                .font(.system(size: 13, weight: .semibold))
-                                .foregroundColor(.white)
+                            Image(systemName: isError ? "xmark.circle.fill" : "checkmark.circle.fill").foregroundColor(isError ? .red : .green).font(.system(size: 12))
+                            Text(status).font(.system(size: 12)).foregroundColor(isError ? .red : .green)
                         }
-                        .padding(.horizontal, 20)
-                        .padding(.vertical, 8)
-                        .background(Color.blue.opacity(0.7))
-                        .cornerRadius(8)
-                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.white.opacity(0.15), lineWidth: 0.5))
                     }
-                    .buttonStyle(.plain)
-                    .disabled((anthropicKey.isEmpty && openAIKey.isEmpty && gatewayToken.isEmpty) || isRestarting)
-                }
 
-                Spacer()
+                    HStack {
+                        Spacer()
+                        Button(action: saveKeys) {
+                            HStack(spacing: 6) {
+                                if isRestarting { ProgressView().scaleEffect(0.6).frame(width: 12, height: 12) }
+                                Text(isRestarting ? "Restarting..." : "Save Keys").font(.system(size: 13, weight: .semibold)).foregroundColor(.white)
+                            }
+                            .padding(.horizontal, 20).padding(.vertical, 8)
+                            .background(Color(red: 1.0, green: 0.25, blue: 0.55).opacity(0.7)).cornerRadius(8)
+                            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.white.opacity(0.15), lineWidth: 0.5))
+                        }
+                        .buttonStyle(.plain)
+                        .disabled((anthropicKey.isEmpty && openAIKey.isEmpty && geminiKey.isEmpty && gatewayToken.isEmpty) || isRestarting)
+                    }
+                }
+                .padding(28)
             }
-            .padding(28)
         }
-        .frame(width: 420, height: 460)
+        .frame(width: 420, height: 560)
         .preferredColorScheme(.dark)
         .onAppear { loadCurrentKeys() }
-        .onDisappear {
-            anthropicRevealed = false
-            openAIRevealed = false
-            gatewayRevealed = false
+        .onDisappear { anthropicRevealed = false; openAIRevealed = false; geminiRevealed = false; gatewayRevealed = false }
+    }
+
+    @ViewBuilder
+    func keyField(label: String, icon: String, placeholder: String, key: Binding<String>, revealed: Binding<Bool>, hasConflict: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label(label, systemImage: icon).font(.system(size: 11, weight: .medium)).foregroundColor(Color.white.opacity(0.5))
+                if hasConflict {
+                    Text("ENV OVERRIDE ACTIVE").font(.system(size: 9, weight: .bold)).foregroundColor(.orange)
+                        .padding(.horizontal, 5).padding(.vertical, 2).background(Color.orange.opacity(0.15)).cornerRadius(4)
+                }
+            }
+            HStack(spacing: 8) {
+                Group {
+                    if revealed.wrappedValue { TextField(placeholder, text: key) }
+                    else { SecureField(placeholder, text: key) }
+                }
+                .textFieldStyle(.plain).font(.system(size: 13)).foregroundColor(.white)
+                .padding(.horizontal, 12).padding(.vertical, 10)
+                .glassBackground(opacity: 0.08, cornerRadius: 8, borderOpacity: hasConflict ? 0.4 : 0.15)
+
+                Button(action: { if revealed.wrappedValue { revealed.wrappedValue = false } else { authenticate { if $0 { revealed.wrappedValue = true } } } }) {
+                    Image(systemName: revealed.wrappedValue ? "eye.slash" : "eye").font(.system(size: 13)).foregroundColor(Color.white.opacity(0.4))
+                        .frame(width: 32, height: 32).glassBackground(opacity: 0.08, cornerRadius: 8, borderOpacity: 0.12)
+                }.buttonStyle(.plain).help(revealed.wrappedValue ? "Hide key" : "Reveal key with Touch ID")
+            }
         }
     }
 
     func loadCurrentKeys() {
-        // Load gateway token from openclaw.json
-        if gatewayToken.isEmpty, let token = OpenClawLoader.shared.readGatewayToken(configPath: state.configPath) {
-            gatewayToken = token
-        }
-
-        // Load existing API keys from the first agent that has them
-        for agent in state.agents {
-            guard let agentConfig = agent.agentConfig else { continue }
-            let agentDir = agentConfig.agentDir ?? ""
-            let path = (agentDir as NSString).appendingPathComponent("auth-profiles.json")
-            let expandedPath = (path as NSString).expandingTildeInPath
-            guard let data = FileManager.default.contents(atPath: expandedPath),
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let profiles = json["profiles"] as? [String: Any] else { continue }
-            if anthropicKey.isEmpty, let p = profiles["anthropic:default"] as? [String: Any], let key = p["key"] as? String {
-                anthropicKey = key
-            }
-            if openAIKey.isEmpty, let p = profiles["openai:default"] as? [String: Any], let key = p["key"] as? String {
-                openAIKey = key
-            }
-            if !anthropicKey.isEmpty && !openAIKey.isEmpty { break }
-        }
+        if let token = OpenClawLoader.shared.readGatewayToken(configPath: state.configPath) { gatewayToken = token }
+        if let key = OpenClawLoader.shared.readAnthropicKey() { anthropicKey = key }
+        if let key = OpenClawLoader.shared.readOpenAIKey() { openAIKey = key }
+        if let key = OpenClawLoader.shared.readGeminiKey() { geminiKey = key }
     }
 
     func saveKeys() {
-        var successCount = 0
-        var failCount = 0
+        var successCount = 0; var failCount = 0
 
-        // Save gateway token to openclaw.json
         if !gatewayToken.isEmpty {
-            if OpenClawLoader.shared.writeGatewayToken(gatewayToken, configPath: state.configPath) {
-                successCount += 1
-            } else {
-                failCount += 1
-            }
+            if OpenClawLoader.shared.writeGatewayToken(gatewayToken, configPath: state.configPath) { successCount += 1 } else { failCount += 1 }
         }
 
-        // Save API keys to each agent's auth-profiles.json
-        for agent in state.agents {
-            guard let agentConfig = agent.agentConfig else { continue }
-            let agentDir = agentConfig.agentDir ?? ""
-            let path = ((agentDir as NSString).appendingPathComponent("auth-profiles.json") as NSString).expandingTildeInPath
-
-            var json: [String: Any] = [:]
-            if let data = FileManager.default.contents(atPath: path),
-               let existing = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                json = existing
-            }
-
-            var profiles = json["profiles"] as? [String: Any] ?? [:]
-
-            if !anthropicKey.isEmpty {
-                profiles["anthropic:default"] = [
-                    "type": "api_key",
-                    "provider": "anthropic",
-                    "key": anthropicKey
-                ]
-            }
-            if !openAIKey.isEmpty {
-                profiles["openai:default"] = [
-                    "type": "api_key",
-                    "provider": "openai",
-                    "key": openAIKey
-                ]
-            }
-
-            json["profiles"] = profiles
-
-            if let data = try? JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted]),
-               (try? data.write(to: URL(fileURLWithPath: path), options: .atomic)) != nil {
-                successCount += 1
-            } else {
-                failCount += 1
-            }
+        var envKeys: [String: String] = [:]
+        if !anthropicKey.isEmpty { envKeys["ANTHROPIC_API_KEY"] = anthropicKey }
+        if !openAIKey.isEmpty    { envKeys["OPENAI_API_KEY"]    = openAIKey }
+        if !geminiKey.isEmpty    { envKeys["GOOGLE_API_KEY"]    = geminiKey }
+        if !envKeys.isEmpty {
+            if OpenClawLoader.shared.writeEnvKeys(envKeys) { successCount += 1 } else { failCount += 1 }
         }
 
-        if failCount > 0 {
-            saveStatus = "Saved \(successCount), failed \(failCount)"
-            isError = true
+        guard failCount == 0 else {
+            saveStatus = "Saved \(successCount), failed \(failCount)"; isError = true
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) { saveStatus = nil }
             return
         }
 
-        // Attempt gateway restart
-        saveStatus = "Saved. Restarting gateway..."
-        isError = false
-        isRestarting = true
-
-        // Set all agents to restarting (solid yellow) during restart
-        for i in state.agents.indices {
-            state.agents[i].status = .restarting
-        }
+        saveStatus = "Saved. Restarting gateway..."; isError = false; isRestarting = true
+        for i in state.agents.indices { state.agents[i].status = .restarting }
 
         DispatchQueue.global(qos: .userInitiated).async {
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/usr/local/bin/openclaw")
             process.arguments = ["gateway", "restart"]
-            process.environment = [
-                "PATH": "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-                "HOME": NSHomeDirectory()
-            ]
-            let pipe = Pipe()
-            process.standardOutput = pipe
-            process.standardError = pipe
-
-            var restartSuccess = false
-            do {
-                try process.run()
-                process.waitUntilExit()
-                let outputData = pipe.fileHandleForReading.readDataToEndOfFile()
-                let output = String(data: outputData, encoding: .utf8) ?? ""
-                print("[APIKeyManager] Gateway restart exit code: \(process.terminationStatus)")
-                print("[APIKeyManager] Gateway restart output: \(output)")
-                restartSuccess = process.terminationStatus == 0
-            } catch {
-                print("[APIKeyManager] Gateway restart error: \(error)")
-                restartSuccess = false
-            }
-
+            var env = ProcessInfo.processInfo.environment
+            env["PATH"] = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+            env["HOME"] = NSHomeDirectory()
+            process.environment = env
+            let pipe = Pipe(); process.standardOutput = pipe; process.standardError = pipe
+            var ok = false
+            do { try process.run(); process.waitUntilExit(); ok = process.terminationStatus == 0 } catch { ok = false }
             DispatchQueue.main.async {
                 self.isRestarting = false
-                if restartSuccess {
-                    self.saveStatus = "Saved and gateway restarted"
-                    self.isError = false
-                    // Set all agents back to idle (green)
-                    for i in self.state.agents.indices {
-                        self.state.agents[i].status = .idle
-                    }
+                if ok {
+                    self.saveStatus = "Saved and gateway restarted"; self.isError = false
+                    for i in self.state.agents.indices { self.state.agents[i].status = .idle }
                 } else {
-                    self.saveStatus = "Saved but gateway restart failed. Restart manually from Terminal."
-                    self.isError = true
-                    // Set all agents to error state (red)
-                    for i in self.state.agents.indices {
-                        self.state.agents[i].status = .error
-                    }
+                    self.saveStatus = "Saved but restart failed — restart manually from Terminal"; self.isError = true
+                    for i in self.state.agents.indices { self.state.agents[i].status = .error }
                 }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 5) { self.saveStatus = nil }
             }

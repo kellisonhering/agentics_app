@@ -23,3 +23,4 @@ struct OpenClawApp: App {
 extension Notification.Name {
     static let showAPIKeyManager = Notification.Name("showAPIKeyManager")
 }
+
