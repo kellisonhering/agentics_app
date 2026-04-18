@@ -85,7 +85,7 @@ Each agent runs in its own isolated workspace with separate memory, session hist
 
 ## Engineering Highlights
 
-- Solved concurrent streaming across multiple agents without token mixing by using a single shared WebSocket manager and controlled stream routing
+- Established concurrent streaming across multiple agents using a single shared WebSocket manager, reducing token routing complexity and laying    the groundwork for per-agent stream isolation built in v2
 - Built timing-independent scroll behavior using a sentinel-based anchoring system to reliably keep the view pinned during real-time updates
 - Designed cross-agent interaction guards to prevent UI and state conflicts when multiple agents are active simultaneously
 - Implemented adaptive streaming UI (typewriter + drain completion) to balance responsiveness with readability during high-frequency updates
