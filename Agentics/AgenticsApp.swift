@@ -21,6 +21,7 @@ struct OpenClawApp: App {
 }
 
 extension Notification.Name {
-    static let showAPIKeyManager = Notification.Name("showAPIKeyManager")
+    static let showAPIKeyManager   = Notification.Name("showAPIKeyManager")
+    static let gatewayDidReconnect = Notification.Name("gatewayDidReconnect")
+    static let gatewayDidInterrupt = Notification.Name("gatewayDidInterrupt") // fired when socket closes mid-stream
 }
-

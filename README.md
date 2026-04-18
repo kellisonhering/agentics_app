@@ -85,7 +85,7 @@ Each agent runs in its own isolated workspace with separate memory, session hist
 
 ## Engineering Highlights
 
-- Solved concurrent streaming across multiple agents without token mixing by using a single shared WebSocket manager and controlled stream routing
+- Established concurrent streaming across multiple agents using a single shared WebSocket manager, reducing token routing complexity and laying    the groundwork for per-agent stream isolation built in v2
 - Built timing-independent scroll behavior using a sentinel-based anchoring system to reliably keep the view pinned during real-time updates
 - Designed cross-agent interaction guards to prevent UI and state conflicts when multiple agents are active simultaneously
 - Implemented adaptive streaming UI (typewriter + drain completion) to balance responsiveness with readability during high-frequency updates
@@ -94,20 +94,20 @@ Each agent runs in its own isolated workspace with separate memory, session hist
 
 ## Testing
 
-The WebSocket token routing logic — the core fix for the multi-agent stream mixing bug — is covered by automated unit tests using XCTest. The WebSocket manager was extracted into its own file (`WebSocketManager.swift`) to make it independently testable without requiring a live gateway connection.
+The cross-agent streaming guard, which prevents sending to a second agent while the first is still responding, is validated by automated unit tests using XCTest. This guard is the primary mechanism ensuring UI state stays consistent when multiple agents are active simultaneously.
 
-Tests simulate gateway frames directly by calling the manager's frame handler, verifying that:
+Tests validate both the happy path and edge cases:
 
-- Tokens from a streaming response are delivered only to the agent that sent the message
-- After a stream completes, a new sender's tokens route correctly to the new handler
-- If a second agent sends while the first is still streaming, the handler switches immediately with no token leakage
-- Empty deltas from the gateway are filtered out and never delivered to the UI
-- The "final" frame clears the handler so stray tokens after stream completion are dropped
-- The active agent ID tracks correctly as ownership changes between agents
+- `streamingAgents` is empty on launch, confirming no agent is incorrectly marked as active before any message is sent
+- Inserting an agent ID marks it as streaming and the self-guard correctly blocks further sends to that agent
+- The cross-agent guard detects when a different agent is streaming and surfaces that agent's name to the UI
+- The cross-agent guard returns nil when only the current agent is streaming, confirming no false positives
+- Removing an agent ID fully clears streaming state, as happens when a response completes
+- With two agents streaming simultaneously, each independently detects the other as blocking, validating the guard holds under concurrent load
 
-These tests validate the current single-handler routing design, which replaced an earlier approach that could intermittently mix tokens between agents.
+All tests operate directly on `AppState` with no live gateway connection required.
 
-See [`AgenticsTests/WebSocketManagerTests.swift`](AgenticsTests/WebSocketManagerTests.swift) for the full test suite.
+See [`AgenticsTests/AppStateTests.swift`](AgenticsTests/AppStateTests.swift) for the full test suite.
 
 ---
 
@@ -125,7 +125,7 @@ See [`AgenticsTests/WebSocketManagerTests.swift`](AgenticsTests/WebSocketManager
 - Chat history persisted per agent with 500 message cap
 - Sentinel-based scroll anchoring — timing-independent scroll to bottom
 - Text selection enabled on all chat bubbles
-- Single shared WebSocket manager — prevents token stream mixing between agents
+- Single shared WebSocket manager — simplifies connection management and ensures all agents share one authenticated gateway session
 
 ---
 
@@ -149,7 +149,7 @@ See [`AgenticsTests/WebSocketManagerTests.swift`](AgenticsTests/WebSocketManager
 - **Auth:** Ed25519 device signing with challenge/response handshake
 - **Data:** JSON-based chat history (`CHAT.json` per agent workspace)
 - **Security:** LocalAuthentication (Touch ID), CryptoKit, atomic file writes
-- **Testing:** XCTest (unit tests for WebSocket token routing)
+- **Testing:** XCTest (unit tests for cross-agent streaming guard)
 
 ---
 
@@ -180,3 +180,4 @@ See [PORTFOLIO.md](PORTFOLIO.md) for a full technical write-up including archite
 ## License
 
 MIT License — see [LICENSE](LICENSE) for details.
+

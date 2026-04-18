@@ -2,6 +2,7 @@ import SwiftUI
 import CryptoKit
 import Security
 import LocalAuthentication
+import UniformTypeIdentifiers
 
 // MARK: - Glass Style Helper
 
@@ -171,11 +172,13 @@ class OpenClawWebSocket: NSObject, URLSessionWebSocketDelegate {
 
     private var pendingMessage:      String?
     private(set) var pendingAgentID: String?
+    private var pendingAttachments:  [[String: Any]]?
 
     // Session-keyed handlers — routes tokens to the correct agent conversation
-    private var tokenHandlers: [String: TokenHandler] = [:]
-    private var errorHandlers: [String: ErrorHandler] = [:]
-    private var runToSession:  [String: String]        = [:] // runId → sessionKey
+    private var tokenHandlers:    [String: TokenHandler] = [:]
+    private var errorHandlers:    [String: ErrorHandler] = [:]
+    private var runToSession:     [String: String]        = [:] // runId → sessionKey
+    private var activeSessionKey: String?                       // last-dispatched session, used for chat:final fallback
 
     /// Broadcasts an error to every registered error handler and clears them.
     private func broadcastError(_ message: String) {
@@ -204,10 +207,11 @@ class OpenClawWebSocket: NSObject, URLSessionWebSocketDelegate {
         super.init()
     }
 
-    func send(message: String, agentID: String, onToken: @escaping TokenHandler, onError: @escaping ErrorHandler) {
+    func send(message: String, agentID: String, attachments: [[String: Any]]? = nil, onToken: @escaping TokenHandler, onError: @escaping ErrorHandler) {
         let sessionKey = "agent:\(agentID):main"
-        pendingMessage  = message
-        pendingAgentID  = agentID
+        pendingMessage     = message
+        pendingAgentID     = agentID
+        pendingAttachments = attachments
         tokenHandlers[sessionKey] = onToken
         errorHandlers[sessionKey] = onError
 
@@ -240,6 +244,27 @@ class OpenClawWebSocket: NSObject, URLSessionWebSocketDelegate {
         isConnected = false
         isReady     = false
         self.webSocketTask = nil
+
+        // If any streams were active when the socket closed, their token events are
+        // gone forever (gateway does not replay events). Clear the handlers and notify
+        // AppState so it can show a "connection interrupted" notice in the affected chats.
+        if !tokenHandlers.isEmpty {
+            let interruptedIds = tokenHandlers.keys.compactMap { key -> String? in
+                let parts = key.split(separator: ":")
+                return parts.count >= 2 ? String(parts[1]) : nil
+            }
+            tokenHandlers.removeAll()
+            errorHandlers.removeAll()
+            activeSessionKey = nil
+            print("[OpenClawWS] ⚠️ Socket closed with active streams: \(interruptedIds)")
+            DispatchQueue.main.async {
+                NotificationCenter.default.post(
+                    name: .gatewayDidInterrupt,
+                    object: nil,
+                    userInfo: ["agentIds": interruptedIds]
+                )
+            }
+        }
     }
 
     private func sendConnectRequest(nonce: String, ts: Int) {
@@ -328,6 +353,9 @@ class OpenClawWebSocket: NSObject, URLSessionWebSocketDelegate {
                     print("[OpenClawWS] 🔓 Handshake complete — ready")
                     isReady = true
                     dispatchPendingMessage()
+                    DispatchQueue.main.async {
+                        NotificationCenter.default.post(name: .gatewayDidReconnect, object: nil)
+                    }
                 } else {
                     let errorObj = json["error"] as? [String: Any]
                     let reason   = errorObj?["message"] as? String ?? "connect rejected"
@@ -386,9 +414,19 @@ class OpenClawWebSocket: NSObject, URLSessionWebSocketDelegate {
             case "chat":
                 let state = payload?["state"] as? String ?? ""
                 if state == "final" {
-                    // Fallback cleanup — clears any handlers that lifecycle end may have missed
                     self.chatRequestID = nil
-                    print("[OpenClawWS] chat.final received")
+                    // Fallback: if lifecycle:end didn't already clean up, signal
+                    // completion now so the sending agent is never stuck "responding".
+                    if let key = self.activeSessionKey,
+                       let handler = self.tokenHandlers.removeValue(forKey: key) {
+                        self.errorHandlers.removeValue(forKey: key)
+                        self.activeSessionKey = nil
+                        print("[OpenClawWS] chat.final fallback → completing \(key)")
+                        DispatchQueue.main.async { handler("") }
+                    } else {
+                        self.activeSessionKey = nil
+                        print("[OpenClawWS] chat.final received (lifecycle:end already handled)")
+                    }
                 }
 
             case "health", "tick":
@@ -409,20 +447,31 @@ class OpenClawWebSocket: NSObject, URLSessionWebSocketDelegate {
         let reqID = UUID().uuidString
         chatRequestID = reqID
 
+        var params: [String: Any] = [
+            "sessionKey":     "agent:\(agentID):main",
+            "message":        message,
+            "idempotencyKey": UUID().uuidString
+        ]
+        if let attachments = pendingAttachments, !attachments.isEmpty {
+            params["attachments"] = attachments
+        }
+
         sendJSON([
             "type":   "req",
             "id":     reqID,
             "method": "chat.send",
-            "params": [
-                "sessionKey":     "agent:\(agentID):main",
-                "message":        message,
-                "idempotencyKey": UUID().uuidString
-            ]
+            "params": params
         ])
-        print("[OpenClawWS] 📤 chat.send → agent=\(agentID)")
+        activeSessionKey = "agent:\(agentID):main"
+        if let attachments = params["attachments"] as? [[String: Any]] {
+            print("[OpenClawWS] 📤 chat.send → agent=\(agentID) with \(attachments.count) attachment(s): \(attachments.map { $0["mimeType"] ?? $0["type"] ?? "unknown" })")
+        } else {
+            print("[OpenClawWS] 📤 chat.send → agent=\(agentID) session=\(activeSessionKey!) (no attachments)")
+        }
 
-        pendingMessage = nil
-        pendingAgentID = nil
+        pendingMessage     = nil
+        pendingAgentID     = nil
+        pendingAttachments = nil
     }
 
     private func sendJSON(_ dict: [String: Any]) {
@@ -586,6 +635,21 @@ class OpenClawLoader {
         guard let newData = try? JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys]) else { return false }
         do { try newData.write(to: URL(fileURLWithPath: expandedPath), options: .atomic); return true }
         catch { print("[KeyStore] Failed to write gateway token: \(error)"); return false }
+    }
+
+    func writeAgentModel(_ model: String, agentId: String, configPath: String) -> Bool {
+        let expandedPath = (configPath as NSString).expandingTildeInPath
+        guard let data = FileManager.default.contents(atPath: expandedPath),
+              var json  = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              var agents = json["agents"] as? [String: Any],
+              var list   = agents["list"] as? [[String: Any]] else { return false }
+        guard let idx = list.firstIndex(where: { $0["id"] as? String == agentId }) else { return false }
+        list[idx]["model"] = ["primary": model]
+        agents["list"] = list
+        json["agents"]  = agents
+        guard let newData = try? JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys]) else { return false }
+        do { try newData.write(to: URL(fileURLWithPath: expandedPath), options: .atomic); return true }
+        catch { print("[OpenClawLoader] Failed to write agent model: \(error)"); return false }
     }
 
     // MARK: - .env File (global API keys for all agents)
@@ -819,13 +883,31 @@ struct Message: Identifiable, Codable {
     var isUser: Bool
     var timestamp: Date
     var agentName: String?
+    var isSystemNotice: Bool
 
-    init(id: UUID = UUID(), content: String, isUser: Bool, timestamp: Date, agentName: String?) {
-        self.id        = id
-        self.content   = content
-        self.isUser    = isUser
-        self.timestamp = timestamp
-        self.agentName = agentName
+    enum CodingKeys: String, CodingKey {
+        case id, content, isUser, timestamp, agentName, isSystemNotice
+    }
+
+    init(id: UUID = UUID(), content: String, isUser: Bool, timestamp: Date, agentName: String?, isSystemNotice: Bool = false) {
+        self.id             = id
+        self.content        = content
+        self.isUser         = isUser
+        self.timestamp      = timestamp
+        self.agentName      = agentName
+        self.isSystemNotice = isSystemNotice
+    }
+
+    // Custom decoder so existing saved chat history (which has no isSystemNotice field)
+    // loads correctly instead of throwing a decoding error.
+    init(from decoder: Decoder) throws {
+        let container   = try decoder.container(keyedBy: CodingKeys.self)
+        id              = try container.decode(UUID.self,   forKey: .id)
+        content         = try container.decode(String.self, forKey: .content)
+        isUser          = try container.decode(Bool.self,   forKey: .isUser)
+        timestamp       = try container.decode(Date.self,   forKey: .timestamp)
+        agentName       = try container.decodeIfPresent(String.self, forKey: .agentName)
+        isSystemNotice  = (try? container.decodeIfPresent(Bool.self, forKey: .isSystemNotice)) ?? false
     }
 }
 
@@ -845,7 +927,52 @@ class AppState: ObservableObject {
     private let avatarColors: [Color] = [.purple, .cyan, .orange, .green, .blue, .pink, .yellow]
     private var agentDefaults: AgentDefaults? = nil
 
-    init() { loadAgents() }
+    init() {
+        loadAgents()
+        NotificationCenter.default.addObserver(
+            forName: .gatewayDidReconnect,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            print("[AppState] Gateway reconnected — clearing BOOTSTRAP.md for all agents")
+            for agent in self.agents { self.clearBootstrapMD(for: agent) }
+        }
+
+        NotificationCenter.default.addObserver(
+            forName: .gatewayDidInterrupt,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let self,
+                  let agentIds = notification.userInfo?["agentIds"] as? [String] else { return }
+            print("[AppState] Connection interrupted — cleaning up streams for: \(agentIds)")
+            for agentId in agentIds {
+                // Remove any empty streaming bubble left behind — it will never receive content
+                if let lastIdx = self.messages[agentId]?.lastIndex(where: { !$0.isUser && !$0.isSystemNotice }),
+                   self.messages[agentId]?[lastIdx].content.isEmpty == true {
+                    self.messages[agentId]?.remove(at: lastIdx)
+                }
+                // Insert a system notice in place of the lost response
+                let notice = Message(
+                    content: "Connection interrupted\nResponse may be incomplete",
+                    isUser: false,
+                    timestamp: Date(),
+                    agentName: nil,
+                    isSystemNotice: true
+                )
+                self.messages[agentId, default: []].append(notice)
+                // Clean up streaming state so the send button unlocks
+                self.streamingAgents.remove(agentId)
+                if let idx = self.agents.firstIndex(where: { $0.id == agentId }) {
+                    self.agents[idx].status = .idle
+                }
+                if let agent = self.agents.first(where: { $0.id == agentId }) {
+                    self.saveChat(for: agent)
+                }
+            }
+        }
+    }
 
     func loadAgents() {
         loadError = nil
@@ -900,6 +1027,7 @@ class AppState: ObservableObject {
         }
 
         isLoaded = true
+        if selectedAgent == nil { selectedAgent = agents.first }
     }
 
     func saveSoulMD(for agent: Agent) -> Bool {
@@ -926,6 +1054,80 @@ class AppState: ObservableObject {
     func saveHeartbeatInterval(for agent: Agent) -> Bool {
         let interval = agent.heartbeatInterval == "off" ? nil : agent.heartbeatInterval
         return OpenClawLoader.shared.updateHeartbeat(agentId: agent.id, interval: interval, configPath: configPath)
+    }
+
+    func writeBootstrapMD(content: String, for agent: Agent) {
+        let path = ((agent.workspacePath as NSString).expandingTildeInPath as NSString)
+            .appendingPathComponent("BOOTSTRAP.md")
+        DispatchQueue.global(qos: .utility).async {
+            do { try content.write(toFile: path, atomically: true, encoding: .utf8)
+                print("[AppState] Wrote BOOTSTRAP.md for \(agent.id)") }
+            catch { print("[AppState] Failed to write BOOTSTRAP.md: \(error)") }
+        }
+    }
+
+    func clearBootstrapMD(for agent: Agent) {
+        let path = ((agent.workspacePath as NSString).expandingTildeInPath as NSString)
+            .appendingPathComponent("BOOTSTRAP.md")
+        DispatchQueue.global(qos: .utility).async {
+            do { try "".write(toFile: path, atomically: true, encoding: .utf8)
+                print("[AppState] Cleared BOOTSTRAP.md for \(agent.id)") }
+            catch { print("[AppState] Failed to clear BOOTSTRAP.md: \(error)") }
+        }
+    }
+
+    /// Appends a model-switch summary entry to handoff-log.md in the agent's workspace.
+    /// Creates the file with a header the first time it is called for a given agent.
+    func appendToHandoffLog(summary: String, fromModel: String, toModel: String, for agent: Agent) {
+        let path = ((agent.workspacePath as NSString).expandingTildeInPath as NSString)
+            .appendingPathComponent("handoff-log.md")
+
+        let formatter        = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        let timestamp        = formatter.string(from: Date())
+
+        let entry = """
+
+
+        ---
+
+        ## \(timestamp)
+        From: \(fromModel) → To: \(toModel)
+
+        \(summary)
+        """
+
+        DispatchQueue.global(qos: .utility).async {
+            if !FileManager.default.fileExists(atPath: path) {
+                let header = "# Handoff Log — \(agent.name)\n"
+                do {
+                    try (header + entry).write(toFile: path, atomically: true, encoding: .utf8)
+                    print("[AppState] Created handoff-log.md for \(agent.id)")
+                } catch {
+                    print("[AppState] Failed to create handoff-log.md: \(error)")
+                }
+            } else {
+                if let fileHandle = FileHandle(forWritingAtPath: path) {
+                    fileHandle.seekToEndOfFile()
+                    if let data = entry.data(using: .utf8) { fileHandle.write(data) }
+                    fileHandle.closeFile()
+                    print("[AppState] Appended to handoff-log.md for \(agent.id)")
+                } else {
+                    print("[AppState] Failed to open handoff-log.md for appending")
+                }
+            }
+        }
+    }
+
+    func updateAgentModel(agentId: String, newModel: String) {
+        if let idx = agents.firstIndex(where: { $0.id == agentId }) {
+            agents[idx].role = newModel
+        }
+        if selectedAgent?.id == agentId {
+            selectedAgent?.role = newModel
+        }
+        let success = OpenClawLoader.shared.writeAgentModel(newModel, agentId: agentId, configPath: configPath)
+        print("[AppState] Model update for \(agentId) → \(newModel): \(success ? "saved" : "failed")")
     }
 
     func updateSidebarPreview(for agentId: String) {
@@ -973,7 +1175,7 @@ struct ContentView: View {
         .frame(minWidth: 900, minHeight: 600)
         .preferredColorScheme(.dark)
         .sheet(isPresented: $showAPIKeyManager) {
-            APIKeyManagerView().environmentObject(state)
+            APIKeyManagerView().environmentObject(state).environmentObject(avatarService)
         }
         .onReceive(NotificationCenter.default.publisher(for: .showAPIKeyManager)) { _ in
             showAPIKeyManager = true
@@ -1174,21 +1376,29 @@ struct ChatView: View {
                                         messages[0...i].filter { $0.isUser == messages[i].isUser }.count - 1
                                     }
                                 )), id: \.0.id) { message, sideIndex in
-                                    let isLastAgentMsg = !message.isUser && message.id == messages.last?.id
-                                    let messageIndex = messages.firstIndex(where: { $0.id == message.id }) ?? 0
-                                    let shouldAnimate = messageIndex >= messages.count - 10
-                                    MessageBubbleView(
-                                        message: message,
-                                        agent: agent,
-                                        sideIndex: sideIndex,
-                                        isThinking: isLastAgentMsg && message.content.isEmpty,
-                                        isLatest: isLastAgentMsg && !message.content.isEmpty,
-                                        shouldAnimate: shouldAnimate
-                                    )
-                                    .id(message.id)
-                                    .listRowBackground(Color.clear)
-                                    .listRowSeparator(.hidden)
-                                    .listRowInsets(EdgeInsets(top: 2, leading: 12, bottom: 2, trailing: 12))
+                                    if message.isSystemNotice {
+                                        SystemNoticeView(content: message.content)
+                                            .id(message.id)
+                                            .listRowBackground(Color.clear)
+                                            .listRowSeparator(.hidden)
+                                            .listRowInsets(EdgeInsets(top: 6, leading: 12, bottom: 6, trailing: 12))
+                                    } else {
+                                        let isLastAgentMsg = !message.isUser && message.id == messages.last?.id
+                                        let messageIndex = messages.firstIndex(where: { $0.id == message.id }) ?? 0
+                                        let shouldAnimate = messageIndex >= messages.count - 10
+                                        MessageBubbleView(
+                                            message: message,
+                                            agent: agent,
+                                            sideIndex: sideIndex,
+                                            isThinking: isLastAgentMsg && message.content.isEmpty,
+                                            isLatest: isLastAgentMsg && !message.content.isEmpty,
+                                            shouldAnimate: shouldAnimate
+                                        )
+                                        .id(message.id)
+                                        .listRowBackground(Color.clear)
+                                        .listRowSeparator(.hidden)
+                                        .listRowInsets(EdgeInsets(top: 2, leading: 12, bottom: 2, trailing: 12))
+                                    }
                                 }
                                 Color.clear.frame(height: 1).id("bottom-sentinel")
                                     .listRowBackground(Color.clear)
@@ -1368,9 +1578,7 @@ struct AvatarPopoverView: View {
         let selectedIdx: Int      = avatarService.selectedHistoryIndex[agent.id] ?? 0
         let workspacePath: String = (agent.workspacePath as NSString).expandingTildeInPath
 
-        ZStack {
-            Color(red: 0.14, green: 0.14, blue: 0.14).ignoresSafeArea()
-            VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 14) {
 
                 // Main avatar preview + star button
                 HStack {
@@ -1438,7 +1646,7 @@ struct AvatarPopoverView: View {
                                             if isSelected {
                                                 Circle()
                                                     .strokeBorder(
-                                                        Color(red: 1.0, green: 0.25, blue: 0.55),
+                                                        Color(red: 1.0, green: 0.25, blue: 0.55).opacity(0.7),
                                                         lineWidth: 2.5
                                                     )
                                                     .frame(width: historySize, height: historySize)
@@ -1469,6 +1677,17 @@ struct AvatarPopoverView: View {
                     .tint(Color(red: 1.0, green: 0.25, blue: 0.55))
                     .scaleEffect(0.75)
                     .frame(width: 40)
+                }
+
+                if avatarService.geminiUnavailable {
+                    HStack(spacing: 4) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 9))
+                            .foregroundColor(.orange)
+                        Text("Using basic mood detection")
+                            .font(.system(size: 10))
+                            .foregroundColor(.orange)
+                    }
                 }
 
                 VStack(alignment: .leading, spacing: 5) {
@@ -1524,8 +1743,7 @@ struct AvatarPopoverView: View {
                 }
             }
             .padding(18)
-        }
-        .frame(width: 320)
+        .frame(width: 320, alignment: .leading)
         .preferredColorScheme(.dark)
         .onAppear { dnaText = avatarService.agentDNA[agent.id] ?? "" }
     }
@@ -1694,6 +1912,48 @@ struct MessageBubbleView: View {
     }
 }
 
+// MARK: - System Notice View
+
+struct SystemNoticeView: View {
+    let content: String
+
+    // First line is the model name, second line is the status
+    private var lines: [String] { content.components(separatedBy: "\n") }
+    private var headline: String { lines.first ?? content }
+    private var statusLine: String? { lines.count > 1 ? lines[1] : nil }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Rectangle()
+                .fill(Color.white.opacity(0.1))
+                .frame(height: 0.5)
+
+            VStack(spacing: 2) {
+                Text(headline)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(Color.white.opacity(0.45))
+                if let status = statusLine {
+                    Text(status)
+                        .font(.system(size: 10))
+                        .foregroundColor(
+                            status.contains("✓")
+                                ? Color(red: 0.3, green: 0.85, blue: 0.5).opacity(0.75)
+                                : Color.white.opacity(0.3)
+                        )
+                }
+            }
+            .fixedSize()
+            .multilineTextAlignment(.center)
+
+            Rectangle()
+                .fill(Color.white.opacity(0.1))
+                .frame(height: 0.5)
+        }
+        .padding(.vertical, 2)
+    }
+}
+
+
 struct BubbleShape: Shape {
     let isUser: Bool
     func path(in rect: CGRect) -> Path {
@@ -1761,28 +2021,16 @@ struct InputBarView: View {
     @Binding var pendingCompact: Bool
     @EnvironmentObject var state: AppState
     @EnvironmentObject var avatarService: AgentAvatarService
-    @State private var pastedContent: String? = nil
+    @State private var pastedContent:       String? = nil
+    @State private var attachedImage:       (name: String, data: Data, mimeType: String)? = nil
+    @State private var showImageSuggestion: Bool = false
+    @State private var plusShift:           CGFloat = 0
 
     var isStreaming: Bool { state.streamingAgents.contains(agent.id) }
 
-    var otherStreamingAgentName: String? {
-        guard let streaming = state.streamingAgents.first(where: { $0 != agent.id }) else { return nil }
-        return state.agents.first(where: { $0.id == streaming })?.name
-    }
-
     var body: some View {
         VStack(spacing: 0) {
-            if let otherName = otherStreamingAgentName {
-                HStack(spacing: 6) {
-                    TypingIndicator()
-                    Text("\(otherName) is responding. Please wait…")
-                        .font(.system(size: 11))
-                        .foregroundColor(Color.white.opacity(0.35))
-                    Spacer()
-                }
-                .padding(.horizontal, 20)
-                .padding(.bottom, 6)
-            } else if isStreaming {
+            if isStreaming {
                 HStack(spacing: 6) {
                     TypingIndicator()
                     Text("\(agent.name) is thinking…")
@@ -1792,6 +2040,67 @@ struct InputBarView: View {
                 }
                 .padding(.horizontal, 20)
                 .padding(.bottom, 6)
+            }
+
+            // Image agent suggestion chip
+            if attachedImage != nil && showImageSuggestion {
+                let visionAgents = state.agents.filter {
+                    let model = ($0.agentConfig?.model?.primary ?? "").lowercased()
+                    return model.contains("anthropic") || model.contains("claude")
+                }
+                let ranked = ModelCostTier.rankedAgents(from: visionAgents)
+                VStack(alignment: .leading, spacing: 0) {
+                    HStack {
+                        Image(systemName: "photo")
+                            .font(.system(size: 11))
+                            .foregroundColor(Color(red: 1.0, green: 0.25, blue: 0.55))
+                        Text("Send image to:")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundColor(Color.white.opacity(0.7))
+                        Spacer()
+                        Button(action: { showImageSuggestion = false }) {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundColor(Color.white.opacity(0.4))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .padding(.bottom, 6)
+
+                    ForEach(ranked, id: \.agent.id) { item in
+                        Button(action: {
+                            state.selectedAgent = item.agent
+                            showImageSuggestion = false
+                        }) {
+                            HStack(spacing: 8) {
+                                Circle()
+                                    .fill(item.agent.avatarColor.opacity(0.25))
+                                    .frame(width: 22, height: 22)
+                                    .overlay(
+                                        Text(String(item.agent.name.prefix(1)).uppercased())
+                                            .font(.system(size: 11, weight: .semibold))
+                                            .foregroundColor(item.agent.avatarColor)
+                                    )
+                                Text("\(item.label): \(item.agent.name.capitalized)")
+                                    .font(.system(size: 12))
+                                    .foregroundColor(.white)
+                                Spacer()
+                                if item.agent.id == agent.id {
+                                    Text("current")
+                                        .font(.system(size: 10))
+                                        .foregroundColor(Color.white.opacity(0.35))
+                                }
+                            }
+                            .padding(.vertical, 4)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(12)
+                .glassBackground(opacity: 0.10, cornerRadius: 10, borderOpacity: 0.15)
+                .padding(.horizontal, 14)
+                .padding(.bottom, 6)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
             }
 
             if let pasted = pastedContent {
@@ -1819,56 +2128,191 @@ struct InputBarView: View {
                 .transition(.move(edge: .bottom).combined(with: .opacity))
             }
 
-            HStack(alignment: .bottom, spacing: 0) {
-                TextField("Message \(agent.name)...", text: $inputText, axis: .vertical)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 13))
-                    .foregroundColor(.white)
-                    .lineLimit(1...5)
-                    .onSubmit { sendMessage() }
-                    .padding(.horizontal, 13)
-                    .padding(.top, 6)
-                    .padding(.bottom, 10)
-                    .onChange(of: inputText) { newValue in
-                        let lines = newValue.components(separatedBy: .newlines)
-                        if lines.count > 10 {
-                            pastedContent = newValue
-                            inputText = ""
-                        } else if newValue.count > 80000 {
-                            inputText = String(newValue.prefix(80000))
-                        }
+            // Attached image pill
+            if let image = attachedImage {
+                HStack(spacing: 8) {
+                    Image(systemName: "photo.fill")
+                        .font(.system(size: 11))
+                        .foregroundColor(Color(red: 1.0, green: 0.25, blue: 0.55))
+                    Text(image.name)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(Color.white.opacity(0.7))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer()
+                    Button(action: { attachedImage = nil; showImageSuggestion = false }) {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundColor(Color.white.opacity(0.4))
                     }
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .glassBackground(opacity: 0.10, cornerRadius: 10, borderOpacity: 0.15)
+                .padding(.horizontal, 14)
+                .padding(.bottom, 6)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
 
-                Button(action: sendMessage) {
-                    AnimatedSendButton()
-                        .opacity((inputText.isEmpty && pastedContent == nil || isStreaming || otherStreamingAgentName != nil) ? 0 : 1)
+            HStack(alignment: .center, spacing: 8) {
+                // Plus button — sits outside the input bar, to its left
+                Button(action: pickImage) {
+                    ZStack {
+                        Circle()
+                            .fill(LinearGradient(
+                                stops: [
+                                    .init(color: Color(red: 1.0,  green: 0.55, blue: 0.10).opacity(0.90), location: max(0, 0.00 - plusShift)),
+                                    .init(color: Color(red: 1.0,  green: 0.25, blue: 0.55).opacity(0.90), location: max(0, min(1, 0.25 - plusShift))),
+                                    .init(color: Color(red: 0.95, green: 0.15, blue: 0.65).opacity(0.90), location: max(0, min(1, 0.50 - plusShift))),
+                                    .init(color: Color(red: 0.30, green: 0.55, blue: 1.00).opacity(0.90), location: max(0, min(1, 0.75 - plusShift))),
+                                    .init(color: Color(red: 0.40, green: 0.78, blue: 1.00).opacity(0.88), location: min(1, 1.00 - plusShift)),
+                                ],
+                                startPoint: .bottomLeading,
+                                endPoint: .topTrailing
+                            ))
+                            .frame(width: 32, height: 32)
+                        Image(systemName: "plus")
+                            .font(.system(size: 17, weight: .medium))
+                            .foregroundColor(.white)
+                    }
                 }
                 .buttonStyle(.plain)
-                .padding(.trailing, 4)
-                .padding(.top, 4)
-                .padding(.bottom, 4)
-                .allowsHitTesting((!inputText.isEmpty || pastedContent != nil) && !isStreaming && otherStreamingAgentName == nil)
+                .onAppear {
+                    withAnimation(.easeInOut(duration: 3.0).repeatForever(autoreverses: true)) {
+                        plusShift = 0.30
+                    }
+                }
+
+                HStack(alignment: .bottom, spacing: 0) {
+                    TextField("Message \(agent.name)...", text: $inputText, axis: .vertical)
+
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 13))
+                        .foregroundColor(.white)
+                        .lineLimit(1...5)
+                        .onSubmit { sendMessage() }
+                        .padding(.horizontal, 13)
+                        .padding(.top, 6)
+                        .padding(.bottom, 10)
+                        .onChange(of: inputText) { newValue in
+                            let lines = newValue.components(separatedBy: .newlines)
+                            if lines.count > 10 {
+                                pastedContent = newValue
+                                inputText = ""
+                            } else if newValue.count > 80000 {
+                                inputText = String(newValue.prefix(80000))
+                            }
+                        }
+
+                    Button(action: sendMessage) {
+                        AnimatedSendButton()
+                            .opacity((inputText.isEmpty && pastedContent == nil && attachedImage == nil || isStreaming) ? 0 : 1)
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.trailing, 4)
+                    .padding(.top, 4)
+                    .padding(.bottom, 4)
+                    .allowsHitTesting((!inputText.isEmpty || pastedContent != nil || attachedImage != nil) && !isStreaming)
+                }
+                .background(
+                    RoundedRectangle(cornerRadius: 20)
+                        .fill(.ultraThinMaterial)
+                        .overlay(RoundedRectangle(cornerRadius: 20).stroke(Color.white.opacity(0.15), lineWidth: 0.5))
+                )
             }
-            .background(
-                RoundedRectangle(cornerRadius: 20)
-                    .fill(.ultraThinMaterial)
-                    .overlay(RoundedRectangle(cornerRadius: 20).stroke(Color.white.opacity(0.15), lineWidth: 0.5))
-            )
         }
         .padding(.horizontal, 14)
         .padding(.bottom, 16)
         .padding(.top, 8)
         .animation(.easeInOut(duration: 0.2), value: pastedContent != nil)
+        .animation(.easeInOut(duration: 0.2), value: attachedImage != nil)
+        .animation(.easeInOut(duration: 0.2), value: showImageSuggestion)
         .onChange(of: pendingCompact) { pending in
             if pending { pendingCompact = false; sendMessage() }
         }
     }
 
-    func sendMessage() {
-        let trimmed = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
-        let hasPasted = pastedContent != nil
+    /// Converts a HEIC file to JPEG data at 90% quality.
+    /// Forces sRGB colour space so Claude's API can decode it —
+    /// HEIC images often carry Display P3 / HDR profiles that confuse the API.
+    /// Returns nil if the file can't be read or any conversion step fails.
+    func convertHEIC(at url: URL) -> Data? {
+        guard let image   = NSImage(contentsOf: url),
+              let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
 
-        guard (!trimmed.isEmpty || hasPasted), !isStreaming, otherStreamingAgentName == nil else { return }
+        // Draw into a plain sRGB context to strip any wide-gamut or HDR colour profile.
+        let width  = cgImage.width
+        let height = cgImage.height
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        guard let context = CGContext(
+            data: nil,
+            width: width, height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: width * 4,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+        ) else { return nil }
+
+        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+        guard let sRGBImage = context.makeImage() else { return nil }
+
+        let rep = NSBitmapImageRep(cgImage: sRGBImage)
+        rep.size = image.size
+        return rep.representation(using: .jpeg, properties: [.compressionFactor: NSNumber(value: 0.9)])
+    }
+
+    func pickImage() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.png, .jpeg, .gif, .webP, .heic]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories    = false
+        panel.message = "Choose an image to send"
+
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        let ext    = url.pathExtension.lowercased()
+        let isHEIC = ext == "heic"
+
+        let imageData:   Data
+        let displayName: String
+        let mimeType:    String
+
+        if isHEIC {
+            guard let converted = convertHEIC(at: url) else {
+                let errMsg = Message(content: "⚠️ Could not convert HEIC file. Try saving it as JPEG first.", isUser: false, timestamp: Date(), agentName: agent.name)
+                if state.messages[agent.id] == nil { state.messages[agent.id] = [] }
+                state.messages[agent.id]?.append(errMsg)
+                return
+            }
+            imageData   = converted
+            displayName = url.deletingPathExtension().lastPathComponent + ".heic → JPEG"
+            mimeType    = "image/jpeg"
+        } else {
+            guard let data = try? Data(contentsOf: url) else { return }
+            imageData   = data
+            displayName = url.lastPathComponent
+            mimeType    = ext == "png" ? "image/png" : ext == "gif" ? "image/gif" : ext == "webp" ? "image/webp" : "image/jpeg"
+        }
+
+        guard imageData.count <= 5 * 1024 * 1024 else {
+            let sizeNote = isHEIC ? " (after HEIC conversion)" : ""
+            let errMsg = Message(content: "⚠️ Image too large\(sizeNote). Maximum size is 5MB.", isUser: false, timestamp: Date(), agentName: agent.name)
+            if state.messages[agent.id] == nil { state.messages[agent.id] = [] }
+            state.messages[agent.id]?.append(errMsg)
+            return
+        }
+
+        attachedImage       = (name: displayName, data: imageData, mimeType: mimeType)
+        showImageSuggestion = true
+    }
+
+    func sendMessage() {
+        let trimmed   = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hasPasted = pastedContent != nil
+        let hasImage  = attachedImage != nil
+
+        guard (!trimmed.isEmpty || hasPasted || hasImage), !isStreaming else { return }
 
         var fullContent = trimmed
         if let pasted = pastedContent {
@@ -1876,7 +2320,7 @@ struct InputBarView: View {
             fullContent = trimmed.isEmpty ? pastedBlock : "\(trimmed)\n\n\(pastedBlock)"
         }
 
-        let displayContent: String = {
+        var displayContent: String = {
             if let pasted = pastedContent {
                 let lineCount = pasted.components(separatedBy: .newlines).count
                 let preview = trimmed.isEmpty ? "📄 Pasted text • \(lineCount) lines" : "\(trimmed)\n📄 Pasted text • \(lineCount) lines"
@@ -1885,13 +2329,28 @@ struct InputBarView: View {
             return trimmed
         }()
 
+        if let image = attachedImage {
+            displayContent = displayContent.isEmpty ? "📎 \(image.name)" : "\(displayContent)\n📎 \(image.name)"
+            // Gateway requires non-empty message text even when an attachment is present
+            if fullContent.isEmpty { fullContent = "Please analyze this image." }
+        }
+
+        // Build attachment payload for gateway if image is attached
+        var attachments: [[String: Any]]? = nil
+        if let image = attachedImage {
+            let base64  = image.data.base64EncodedString()
+            attachments = [["type": "image", "mimeType": image.mimeType, "content": base64]]
+        }
+
         let userMsg = Message(content: displayContent, isUser: true, timestamp: Date(), agentName: nil)
         if state.messages[agent.id] == nil { state.messages[agent.id] = [] }
         state.messages[agent.id]?.append(userMsg)
         state.updateSidebarPreview(for: agent.id)
 
-        inputText     = ""
-        pastedContent = nil
+        inputText           = ""
+        pastedContent       = nil
+        attachedImage       = nil
+        showImageSuggestion = false
         state.streamingAgents.insert(agent.id)
 
         DispatchQueue.main.async {
@@ -1900,16 +2359,17 @@ struct InputBarView: View {
             }
         }
 
-        let agentId       = agent.id
-        let agentName     = agent.name
-        let messageToSend = fullContent
+        let agentId         = agent.id
+        let agentName       = agent.name
+        let messageToSend   = fullContent
+        let imageAttachments = attachments
 
         Task {
-            await streamResponse(agentId: agentId, agentName: agentName, message: messageToSend)
+            await streamResponse(agentId: agentId, agentName: agentName, message: messageToSend, attachments: imageAttachments)
         }
     }
 
-    func streamResponse(agentId: String, agentName: String, message: String) async {
+    func streamResponse(agentId: String, agentName: String, message: String, attachments: [[String: Any]]? = nil) async {
         let replyId     = UUID()
         let placeholder = Message(id: replyId, content: "", isUser: false, timestamp: Date(), agentName: agentName)
         state.messages[agentId]?.append(placeholder)
@@ -1979,8 +2439,9 @@ struct InputBarView: View {
             displayLink = dl
 
             state.wsManager.send(
-                message: message,
-                agentID: agentId,
+                message:     message,
+                agentID:     agentId,
+                attachments: attachments,
 
                 onToken: { token in
                     if token.isEmpty {
@@ -2341,6 +2802,102 @@ struct AgentSettingsPanel: View {
     @Binding var agent: Agent
     @EnvironmentObject var state: AppState
     @EnvironmentObject var avatarService: AgentAvatarService
+    @State private var showModelPicker    = false
+    @State private var modelChanged       = false
+    @State private var isRestartingModel  = false
+    @State private var modelRestartFailed = false
+    @State private var previousModel      = ""   // captured before updateAgentModel() runs
+
+    func restartGateway() {
+        let messages      = state.messages[agent.id] ?? []
+        let agentName     = agent.name
+        let agentCopy     = agent  // capture value for background thread
+        let toModel       = agent.role   // already updated to new model by updateAgentModel()
+        let fromModel     = previousModel
+        let toModelName   = ModelCostTier.availableModels.first(where: { $0.id == toModel })?.displayName ?? toModel
+        let fromModelName = ModelCostTier.availableModels.first(where: { $0.id == fromModel })?.displayName ?? fromModel
+
+        for i in state.agents.indices { state.agents[i].status = .restarting }
+        isRestartingModel  = true
+        modelRestartFailed = false
+
+        // Runs the actual gateway restart process, then clears BOOTSTRAP.md and inserts
+        // a system notice into the chat confirming the switch and whether context was transferred.
+        let performRestart = { (summarySent: Bool) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: "/usr/local/bin/openclaw")
+                process.arguments = ["gateway", "restart"]
+                var env = ProcessInfo.processInfo.environment
+                env["PATH"] = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+                env["HOME"] = NSHomeDirectory()
+                process.environment = env
+                process.standardOutput = Pipe()
+                process.standardError  = Pipe()
+                var success = false
+                do { try process.run(); process.waitUntilExit(); success = process.terminationStatus == 0 }
+                catch { success = false }
+                // Always clear BOOTSTRAP.md after restart whether it succeeded or not.
+                DispatchQueue.main.async { self.state.clearBootstrapMD(for: agentCopy) }
+                DispatchQueue.main.async {
+                    self.isRestartingModel = false
+                    if success {
+                        self.modelChanged = false
+                        for i in self.state.agents.indices { self.state.agents[i].status = .idle }
+                        // Insert a system notice into the chat confirming the model switch.
+                        let noticeText = summarySent
+                            ? "Switched to \(toModelName)\nContext summary transferred ✓"
+                            : "Switched to \(toModelName)\nNo prior context to transfer"
+                        let notice = Message(
+                            content: noticeText,
+                            isUser: false,
+                            timestamp: Date(),
+                            agentName: nil,
+                            isSystemNotice: true
+                        )
+                        self.state.messages[agentCopy.id, default: []].append(notice)
+                        self.state.saveChat(for: agentCopy)
+                    } else {
+                        self.modelRestartFailed = true
+                        for i in self.state.agents.indices { self.state.agents[i].status = .error }
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { self.modelRestartFailed = false }
+                    }
+                }
+            }
+        }
+
+        // If no chat history exists, skip summarization and restart immediately.
+        guard !messages.isEmpty else { performRestart(false); return }
+
+        // Clear any stale BOOTSTRAP.md from a previous failed restart before writing the new one.
+        state.clearBootstrapMD(for: agentCopy)
+
+        // Summarize the chat, write to BOOTSTRAP.md, log to handoff-log.md, then restart.
+        SummaryService.shared.summarizeChat(messages: messages, agentName: agentName) { [self] summary in
+            var summarySent = false
+            if let summary {
+                let bootstrapContent = """
+                # Recent Conversation Context
+
+                The following is a summary of the conversation before the model was switched. \
+                Use this as context for the new session:
+
+                \(summary)
+                """
+                DispatchQueue.main.async { self.state.writeBootstrapMD(content: bootstrapContent, for: agentCopy) }
+                DispatchQueue.main.async {
+                    self.state.appendToHandoffLog(
+                        summary: summary,
+                        fromModel: fromModelName,
+                        toModel: toModelName,
+                        for: agentCopy
+                    )
+                }
+                summarySent = true
+            }
+            performRestart(summarySent)
+        }
+    }
 
     var body: some View {
         ZStack {
@@ -2353,10 +2910,72 @@ struct AgentSettingsPanel: View {
                     VStack(alignment: .leading, spacing: 6) {
                         Label("Model", systemImage: "cpu")
                             .font(.system(size: 11, weight: .medium)).foregroundColor(Color.white.opacity(0.5))
-                        Text(agent.role).font(.system(size: 13)).foregroundColor(.white)
-                            .padding(.horizontal, 10).padding(.vertical, 8)
+                        Button(action: { showModelPicker.toggle() }) {
+                            HStack(spacing: 6) {
+                                Text(ModelCostTier.availableModels.first(where: { $0.id == agent.role })?.displayName ?? agent.role)
+                                    .font(.system(size: 13)).foregroundColor(.white)
+                                Image(systemName: "chevron.up.chevron.down")
+                                    .font(.system(size: 10))
+                                    .foregroundColor(.white)
+                                    .padding(4)
+                                    .background(Circle().fill(Color.white.opacity(0.2)))
+                            }
                             .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 10).padding(.vertical, 8)
+                            .frame(maxWidth: .infinity)
                             .glassBackground(opacity: 0.08, cornerRadius: 8, borderOpacity: 0.12)
+                        }
+                        .buttonStyle(.plain)
+                        .popover(isPresented: $showModelPicker, arrowEdge: .bottom) {
+                            VStack(alignment: .leading, spacing: 0) {
+                                ForEach(ModelCostTier.availableModels, id: \.id) { model in
+                                    Button(action: {
+                                        previousModel = agent.role  // capture before the switch happens
+                                        state.updateAgentModel(agentId: agent.id, newModel: model.id)
+                                        showModelPicker = false
+                                        modelChanged = true
+                                    }) {
+                                        HStack {
+                                            Text(model.displayName)
+                                                .font(.system(size: 13)).foregroundColor(.white)
+                                            Spacer()
+                                            if agent.role == model.id {
+                                                Image(systemName: "checkmark")
+                                                    .font(.system(size: 11))
+                                                    .foregroundColor(Color(red: 1.0, green: 0.25, blue: 0.55))
+                                            }
+                                        }
+                                        .padding(.horizontal, 14).padding(.vertical, 9)
+                                        .contentShape(Rectangle())
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                            .frame(width: 220)
+                            .padding(.vertical, 4)
+                        }
+                        if modelChanged {
+                            HStack(spacing: 8) {
+                                Image(systemName: "exclamationmark.circle.fill")
+                                    .font(.system(size: 11))
+                                    .foregroundColor(.orange)
+                                Text("Restart required to apply")
+                                    .font(.system(size: 11))
+                                    .foregroundColor(.orange)
+                                Spacer()
+                                Button(action: restartGateway) {
+                                    Text(isRestartingModel ? "Restarting…" : modelRestartFailed ? "Failed" : "Restart")
+                                        .font(.system(size: 11, weight: .semibold))
+                                        .foregroundColor(.white)
+                                        .padding(.horizontal, 10).padding(.vertical, 4)
+                                        .background(isRestartingModel ? Color.gray.opacity(0.4) : Color(red: 1.0, green: 0.25, blue: 0.55).opacity(0.7))
+                                        .cornerRadius(6)
+                                }
+                                .buttonStyle(.plain)
+                                .disabled(isRestartingModel)
+                            }
+                            .padding(.top, 4)
+                        }
                     }
 
                     VStack(alignment: .leading, spacing: 6) {
@@ -2369,7 +2988,7 @@ struct AgentSettingsPanel: View {
                     }
 
                     VStack(alignment: .leading, spacing: 6) {
-                        Label("Avatar Generation", systemImage: "photo.sparkles")
+                        Label("Avatar Generation", systemImage: "wand.and.stars")
                             .font(.system(size: 11, weight: .medium)).foregroundColor(Color.white.opacity(0.5))
                         HStack {
                             Text("Avatar generation")
@@ -2390,6 +3009,7 @@ struct AgentSettingsPanel: View {
                     }
 
                     PersonalityMatrixView(agent: $agent).environmentObject(state)
+                    DreamDiaryView(agent: $agent)
                     HeartbeatEditorView(agent: $agent).environmentObject(state)
 
                     VStack(alignment: .leading, spacing: 6) {
@@ -2449,6 +3069,7 @@ struct EmptyStateView: View {
 
 struct APIKeyManagerView: View {
     @EnvironmentObject var state: AppState
+    @EnvironmentObject var avatarService: AgentAvatarService
     @Environment(\.dismiss) var dismiss
 
     @State private var anthropicKey: String = ""
@@ -2527,6 +3148,18 @@ struct APIKeyManagerView: View {
 
                     // Gemini
                     keyField(label: "Gemini (Avatar Generation)", icon: "camera.filters", placeholder: "AIza...", key: $geminiKey, revealed: $geminiRevealed, hasConflict: geminiEnvConflict)
+
+                    if !geminiKey.isEmpty && avatarService.geminiUnavailable {
+                        HStack(spacing: 5) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .font(.system(size: 10))
+                                .foregroundColor(.orange)
+                            Text("Gemini quota exceeded — using basic mood detection")
+                                .font(.system(size: 10))
+                                .foregroundColor(.orange)
+                        }
+                        .padding(.top, -4)
+                    }
 
                     // Gateway Token
                     VStack(alignment: .leading, spacing: 8) {

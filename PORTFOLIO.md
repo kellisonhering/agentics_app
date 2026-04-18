@@ -48,7 +48,7 @@ Settings panel (collapsible, right edge) with Heartbeat editor and Personality M
 
 ### Architecture & Reliability
 
-Single shared WebSocket manager across all agents — prevents token stream mixing between agent sessions. Streaming state (`isStreaming`) stored in `AppState` as a `Set<String>` — persists correctly across agent switches without resetting. Cross-agent streaming guard — if one agent is responding and you switch to another, a banner shows above the input bar and sending is blocked until the stream completes. Flexible JSON decoder — handles both string and object model field shapes from `openclaw.json`. Agent names auto-capitalized from config regardless of how they are stored in the gateway. Chat history persisted to `CHAT.json` per agent (500 message cap). History loaded on app launch, sidebar reflects last message. Scroll to bottom on conversation load and new messages (sentinel-based, timing-independent).
+Single shared WebSocket manager across all agents — simplifies connection management and ensures all agents share one authenticated gateway session. Cross-agent streaming guard — if one agent is responding and you switch to another, a banner shows above the input bar and sending is blocked until the stream completes. Flexible JSON decoder — handles both string and object model field shapes from `openclaw.json`. Agent names auto-capitalized from config regardless of how they are stored in the gateway. Chat history persisted to `CHAT.json` per agent (500 message cap). History loaded on app launch, sidebar reflects last message. Scroll to bottom on conversation load and new messages (sentinel-based, timing-independent).
 
 ## Key Engineering Decisions
 
@@ -70,7 +70,7 @@ Single shared WebSocket manager across all agents — prevents token stream mixi
 
 **Tradeoff:** A single shared connection means only one `pendingTokenHandler` is active at a time, keyed to the most recently sent message. This serializes token routing but sacrifices true parallelism — a worthwhile tradeoff given that the gateway itself processes one agent session at a time.
 
-**Result:** Token streams are always routed to the correct conversation. The failure mode (wrong agent receiving tokens) is eliminated entirely.
+**Result:** Token stream mixing became significantly less frequent. The architecture established a single authoritative connection, laying the groundwork for a more robust routing solution built in v2.
 
 ### 3. Global State Management Across Agent Switches
 

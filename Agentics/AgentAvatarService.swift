@@ -19,6 +19,7 @@ class AgentAvatarService: ObservableObject {
     @Published var avatarHistory:        [String: [CGImage]] = [:]
     @Published var selectedHistoryIndex: [String: Int]       = [:]
     @Published var generationDisabled:   Set<String>         = []
+    @Published var geminiUnavailable:    Bool                = false
 
     private var messageCounters: [String: Int] = [:]
 
@@ -96,14 +97,18 @@ class AgentAvatarService: ObservableObject {
         if let geminiKey, !geminiKey.isEmpty {
             // Ask Gemini to describe only mood, lighting, environment — not character appearance
             if let geminiDescription = await callGemini(messages: recentMessages, agentName: agentName, apiKey: geminiKey, agentId: agentId) {
+                geminiUnavailable = false
                 prompt = buildPrompt(dna: dna, agentName: agentName, geminiDescription: geminiDescription)
             } else {
-                // Gemini failed — fall back to DNA-only prompt
-                prompt = buildFallbackPrompt(dna: dna, agentName: agentName)
+                // Gemini failed (quota exceeded or error) — use basic mood detection as middle tier
+                geminiUnavailable = true
+                let basicMood = detectMood(from: Array(messages.suffix(3)))
+                prompt = buildPrompt(dna: dna, agentName: agentName, geminiDescription: basicMood)
             }
         } else {
-            // No Gemini key — use DNA-only prompt
-            prompt = buildFallbackPrompt(dna: dna, agentName: agentName)
+            // No Gemini key configured — use basic mood detection silently
+            let basicMood = detectMood(from: Array(messages.suffix(3)))
+            prompt = buildPrompt(dna: dna, agentName: agentName, geminiDescription: basicMood)
         }
 
         print("[AvatarService] Generating avatar for \(agentName): \(prompt)")
@@ -150,6 +155,40 @@ class AgentAvatarService: ObservableObject {
     private func buildFallbackPrompt(dna: String, agentName: String) -> String {
         let base = dna.isEmpty ? "\(agentName), an AI assistant character" : dna
         return "\(base), single figure, centered, solid color background, no frame, no border, stylized digital painting, soft warm lighting, semi-realistic, high quality"
+    }
+
+    // MARK: - Basic Mood Detection (Gemini fallback)
+
+    /// Analyzes the last 3 messages and returns a simple mood/atmosphere string
+    /// to use in the DALL-E prompt when Gemini is unavailable.
+    private func detectMood(from messages: [Message]) -> String {
+        let text = messages.suffix(3)
+            .map { $0.content }
+            .joined(separator: " ")
+            .lowercased()
+
+        let technical = ["code", "error", "bug", "function", "debug", "api", "build", "deploy", "crash", "fix"]
+        let urgent    = ["urgent", "help", "problem", "issue", "broken", "wrong", "fail", "stuck", "confused"]
+        let positive  = ["thanks", "great", "awesome", "perfect", "love", "excellent", "amazing", "good job"]
+        let creative  = ["design", "create", "idea", "imagine", "concept", "make", "art", "build"]
+        let curious   = ["what", "how", "why", "explain", "curious", "wonder", "interesting", "tell me"]
+
+        if technical.contains(where: { text.contains($0) }) {
+            return "cool blue tones, focused technical atmosphere, clean precise lighting"
+        }
+        if urgent.contains(where: { text.contains($0) }) {
+            return "sharp dramatic lighting, tense focused atmosphere, high contrast"
+        }
+        if positive.contains(where: { text.contains($0) }) {
+            return "warm golden lighting, friendly relaxed atmosphere, soft tones"
+        }
+        if creative.contains(where: { text.contains($0) }) {
+            return "vibrant creative atmosphere, warm inspiring light, energetic mood"
+        }
+        if curious.contains(where: { text.contains($0) }) {
+            return "soft natural lighting, thoughtful curious atmosphere, gentle tones"
+        }
+        return "neutral soft lighting, calm professional atmosphere"
     }
 
     // MARK: - Gemini Flash API Call
