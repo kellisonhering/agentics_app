@@ -125,7 +125,7 @@ See [`AgenticsTests/AppStateTests.swift`](AgenticsTests/AppStateTests.swift) for
 - Chat history persisted per agent with 500 message cap
 - Sentinel-based scroll anchoring — timing-independent scroll to bottom
 - Text selection enabled on all chat bubbles
-- Single shared WebSocket manager — prevents token stream mixing between agents
+- Single shared WebSocket manager — simplifies connection management and ensures all agents share one authenticated gateway session
 
 ---
 
