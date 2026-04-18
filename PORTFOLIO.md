@@ -70,7 +70,7 @@ Single shared WebSocket manager across all agents — simplifies connection mana
 
 **Tradeoff:** A single shared connection means only one `pendingTokenHandler` is active at a time, keyed to the most recently sent message. This serializes token routing but sacrifices true parallelism — a worthwhile tradeoff given that the gateway itself processes one agent session at a time.
 
-**Result:** Token streams are always routed to the correct conversation. The failure mode (wrong agent receiving tokens) is eliminated entirely.
+**Result:** Token stream mixing became significantly less frequent. The architecture established a single authoritative connection, laying the groundwork for a more robust routing solution built in v2.
 
 ### 3. Global State Management Across Agent Switches
 
