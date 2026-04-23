@@ -17,6 +17,14 @@ xcuserdata/
 auth-profiles.json
 openclaw.json
 
+# Claude session memory — never commit
+CLAUDE.md
+AGENTS.md
+.claude/
+
+# Derived data
+.deriveddata/
+
 # Swift Package Manager
 .build/
 .swiftpm/
