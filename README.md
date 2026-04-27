@@ -10,12 +10,12 @@
 
 Agentics is a native macOS application for running and managing multiple AI agents 
 simultaneously over a real-time WebSocket connection. It solves the concurrency and 
-streaming challenges that arise when multiple agents are active at once — token routing, 
-state isolation, and context preservation across model switches — wrapped in a polished, 
+streaming challenges that arise when multiple agents are active at once: token routing, 
+state isolation, and context preservation across model switches, wrapped in a polished, 
 iMessage-style interface.
 
 Connects to a self-hosted [OpenClaw](https://openclaw.ai) gateway. Built to go beyond 
-what the default OpenClaw web UI offers — native, fast, and visually distinct.
+what the default OpenClaw web UI offers: native, fast, and visually distinct.
 
 ---
 
@@ -86,14 +86,14 @@ the in-app model picker.
 
 ## Engineering Highlights
 
-- Built a chat summarization and context injection system using GPT-4.1 Nano — 
+- Built a chat summarization and context injection system using GPT-4.1 Nano: 
   before every model switch, the full conversation is compressed into a structured 
   handoff note and written to BOOTSTRAP.md; the new model reads it automatically on 
   restart so context is never lost, even across completely different AI providers
 - Replaced a single shared WebSocket handler with per-agent sessionKey dictionaries, 
   eliminating token stream mixing between agents under concurrent load
 - Designed a two-safety-net BOOTSTRAP.md cleanup strategy to ensure stale context never 
-  persists across sessions — cleared at restart start and again on WebSocket reconnect
+  persists across sessions, cleared at restart start and again on WebSocket reconnect
 - Established concurrent streaming across multiple agents using a shared WebSocket manager 
   with sessionKey-based routing for correct token isolation per agent
 - Built a scroll system that stays anchored during asynchronous layout updates, 
@@ -175,7 +175,7 @@ All tests operate without a live gateway connection.
 - **Language:** Swift
 - **Framework:** SwiftUI (macOS)
 - **AI Providers:** Anthropic (Claude Haiku 4.5, Claude Sonnet 4.6), OpenAI (GPT-4o-mini, 
-  GPT-4.1 Nano), Google (Gemini — mood detection and avatar description)
+  GPT-4.1 Nano), Google (Gemini, mood detection and avatar description)
 - **Image Generation:** DALL-E 3 (agent avatars, dream banners)
 - **Transport:** WebSocket (`ws://127.0.0.1:18789`)
 - **Auth:** Ed25519 device signing with challenge/response handshake
@@ -191,7 +191,7 @@ All tests operate without a live gateway connection.
 A Python MCP server that exposes IBM Quantum hardware to AI agents as tools. Agents can 
 build and run quantum circuits, submit jobs to real IBM hardware, and retrieve results. 
 Designed as the foundation for a research agent that collects simulator vs real hardware 
-divergence data — a dataset no existing LLM has been trained on.
+divergence data, a dataset no existing LLM has been trained on.
 
 ---
 
