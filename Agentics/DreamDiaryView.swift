@@ -18,7 +18,8 @@ import SwiftUI
 // MARK: - Model
 
 struct DreamEntry {
-    let realDate:  String  // "2026-04-20" — used to match and save dream-YYYY-MM-DD.png
+    let realDate:  String  // "2026-04-20" — used to match and save dream-YYYY-MM-DD-{index}.png
+    let index:     Int     // Position among entries sharing the same date (0, 1, 2…)
     let timestamp: String  // Display timestamp (time randomised ±90 min from 3:00 AM)
     let content:   String
 }
@@ -80,7 +81,7 @@ struct DreamDiaryView: View {
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
 
-        let parsed: [DreamEntry] = blocks.compactMap { block in
+        let rawParsed: [(realDate: String, timestamp: String, content: String)] = blocks.compactMap { block in
             let lines = block.components(separatedBy: "\n")
             guard let tsIdx = lines.firstIndex(where: {
                 $0.hasPrefix("*") && $0.hasSuffix("*") && !$0.dropFirst().dropLast().contains("\n")
@@ -94,7 +95,15 @@ struct DreamDiaryView: View {
                 .joined(separator: "\n")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
 
-            return DreamEntry(realDate: realDate, timestamp: timestamp, content: content)
+            return (realDate: realDate, timestamp: timestamp, content: content)
+        }
+
+        // Assign index per date so multiple dreams on the same night get unique image files
+        var dateCounts: [String: Int] = [:]
+        let parsed: [DreamEntry] = rawParsed.map { raw in
+            let idx = dateCounts[raw.realDate, default: 0]
+            dateCounts[raw.realDate] = idx + 1
+            return DreamEntry(realDate: raw.realDate, index: idx, timestamp: raw.timestamp, content: raw.content)
         }
 
         // Newest first, capped at 5
@@ -362,7 +371,19 @@ struct DreamDiarySheet: View {
                 .frame(height: 180)
                 .clipped()
                 .clipShape(RoundedRectangle(cornerRadius: 10))
-        } else if imageGenerationEnabled && imageService.generatingFor.contains(entry.realDate) {
+                .overlay {
+                    // Vignette — dark edges fade to clear, simulates sitting inside a well
+                    RoundedRectangle(cornerRadius: 10)
+                        .fill(
+                            RadialGradient(
+                                colors: [.clear, Color.black.opacity(0.75)],
+                                center: .center,
+                                startRadius: 60,
+                                endRadius: 200
+                            )
+                        )
+                }
+        } else if imageGenerationEnabled && imageService.generatingFor.contains("\(entry.realDate)-\(entry.index)") {
             RoundedRectangle(cornerRadius: 10)
                 .fill(Color.white.opacity(0.04))
                 .frame(maxWidth: .infinity)

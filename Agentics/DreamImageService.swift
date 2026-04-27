@@ -26,7 +26,7 @@ final class DreamImageService: ObservableObject {
     /// Returns the local path to a cached image for the given entry, or nil if none exists.
     func imagePath(for entry: DreamEntry, workspace: String) -> String? {
         let expanded = (workspace as NSString).expandingTildeInPath
-        let path = (expanded as NSString).appendingPathComponent("dream-\(entry.realDate).png")
+        let path = (expanded as NSString).appendingPathComponent("dream-\(entry.realDate)-\(entry.index).png")
         return FileManager.default.fileExists(atPath: path) ? path : nil
     }
 
@@ -44,9 +44,10 @@ final class DreamImageService: ObservableObject {
 
     /// Generates a single dream image and saves it to the agent's workspace.
     func generate(for entry: DreamEntry, workspace: String, agentId: String) async {
-        guard !generatingFor.contains(entry.realDate) else { return }
-        generatingFor.insert(entry.realDate)
-        defer { generatingFor.remove(entry.realDate) }
+        let entryKey = "\(entry.realDate)-\(entry.index)"
+        guard !generatingFor.contains(entryKey) else { return }
+        generatingFor.insert(entryKey)
+        defer { generatingFor.remove(entryKey) }
 
         guard let apiKey = OpenClawLoader.shared.readOpenAIKey(), !apiKey.isEmpty else {
             print("[DreamImageService] No OpenAI key found — skipping generation")
@@ -63,7 +64,7 @@ final class DreamImageService: ObservableObject {
         guard let imageData = await callDALLE(prompt: prompt, apiKey: apiKey) else { return }
 
         let expanded = (workspace as NSString).expandingTildeInPath
-        let path = (expanded as NSString).appendingPathComponent("dream-\(entry.realDate).png")
+        let path = (expanded as NSString).appendingPathComponent("dream-\(entry.realDate)-\(entry.index).png")
         try? imageData.write(to: URL(fileURLWithPath: path))
     }
 

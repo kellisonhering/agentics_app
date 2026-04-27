@@ -458,7 +458,7 @@ class AppState: ObservableObject {
     let wsManager = OpenClawWebSocket()
 
     private let avatarColors: [Color] = [.purple, .cyan, .orange, .green, .blue, .pink, .yellow]
-    private var agentDefaults: AgentDefaults? = nil
+    var agentDefaults: AgentDefaults? = nil
 
     init() {
         loadAgents()
@@ -978,6 +978,7 @@ struct ChatHeaderView: View {
     @State private var ringShift: CGFloat = 0
     @State private var ringOpacity: Double = 0
     @State private var ringWidth: CGFloat = 2
+    @State private var avatarScale: CGFloat = 1.0
 
     var body: some View {
         let avatarImage: CGImage? = avatarService.avatarImages[agent.id]
@@ -991,6 +992,7 @@ struct ChatHeaderView: View {
                             .scaledToFill()
                             .frame(width: 56, height: 56)
                             .clipShape(Circle())
+                            .scaleEffect(avatarScale)
                     } else {
                         Circle()
                             .fill(agent.avatarColor.opacity(0.15))
@@ -1005,16 +1007,17 @@ struct ChatHeaderView: View {
                         .strokeBorder(
                             AngularGradient(
                                 stops: [
-                                    .init(color: Color(red: 1.0,  green: 0.55, blue: 0.10), location: max(0, min(1, 0.00 + ringShift))),
-                                    .init(color: Color(red: 1.0,  green: 0.25, blue: 0.55), location: max(0, min(1, 0.25 + ringShift))),
-                                    .init(color: Color(red: 0.95, green: 0.15, blue: 0.65), location: max(0, min(1, 0.50 + ringShift))),
-                                    .init(color: Color(red: 0.30, green: 0.55, blue: 1.00), location: max(0, min(1, 0.75 + ringShift))),
-                                    .init(color: Color(red: 0.40, green: 0.78, blue: 1.00), location: max(0, min(1, 1.00 + ringShift))),
+                                    .init(color: Color(red: 1.0,  green: 0.55, blue: 0.10), location: 0.00),
+                                    .init(color: Color(red: 1.0,  green: 0.25, blue: 0.55), location: 0.25),
+                                    .init(color: Color(red: 0.95, green: 0.15, blue: 0.65), location: 0.50),
+                                    .init(color: Color(red: 0.30, green: 0.55, blue: 1.00), location: 0.75),
+                                    .init(color: Color(red: 0.40, green: 0.78, blue: 1.00), location: 1.00),
                                 ],
                                 center: .center
                             ),
                             lineWidth: ringWidth
                         )
+                        .rotationEffect(.degrees(ringShift * 360))
                         .frame(width: 56, height: 56)
                         .opacity(ringOpacity)
                         .shadow(color: Color(red: 0.95, green: 0.15, blue: 0.65).opacity(0.5), radius: 4)
@@ -1076,10 +1079,12 @@ struct ChatHeaderView: View {
         ringOpacity = 0
         withAnimation(.easeIn(duration: 0.3)) { ringOpacity = 0.85 }
         withAnimation(.linear(duration: 2.0).repeatForever(autoreverses: false)) { ringShift = 1.0 }
+        withAnimation(.easeInOut(duration: 1.8).repeatForever(autoreverses: true)) { avatarScale = 1.06 }
     }
 
     private func flashOnArrival() {
         withAnimation(.easeOut(duration: 0.15)) { ringWidth = 3.5; ringOpacity = 1.0 }
+        withAnimation(.easeOut(duration: 0.3)) { avatarScale = 1.0 }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
             withAnimation(.easeOut(duration: 0.6)) { ringWidth = 2; ringOpacity = 0 }
             ringShift = 0

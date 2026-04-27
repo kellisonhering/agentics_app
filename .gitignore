@@ -31,3 +31,7 @@ AGENTS.md
 
 # CocoaPods (if ever added)
 Pods/
+
+# Separate projects — not part of Agentics v2, will move to own repos
+exoplanet-mcp/
+quantum-mcp/
