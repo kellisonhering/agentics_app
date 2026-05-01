@@ -58,8 +58,11 @@ Without the gateway, the UI can still be explored, but agent responses will not 
 
 *A native macOS AI agent system with memory consolidation and personality-driven agents. Features a "Dream Diary" that transforms interaction history into reflective narratives.*
 
+<div align="center">
+
 <img width="559" height="578" alt="Screenshot 2026-04-27 at 3 04 08 AM" src="https://github.com/user-attachments/assets/0c313524-9931-4566-832c-305a301d5dca" />
 
+</div>
 
 ---
 
@@ -67,11 +70,11 @@ Without the gateway, the UI can still be explored, but agent responses will not 
 
 *AI-generated agent portraits that update based on mood. Each agent has a unique visual identity that evolves with the conversation.*
 
-
+<div align="center">
 
 https://github.com/user-attachments/assets/5a4dcaed-e3ec-4084-aa79-fecaa2ce8457
 
-
+</div>
 
 ---
 
