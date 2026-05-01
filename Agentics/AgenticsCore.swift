@@ -992,7 +992,7 @@ struct ChatHeaderView: View {
                             .scaledToFill()
                             .frame(width: 56, height: 56)
                             .clipShape(Circle())
-                            .scaleEffect(avatarScale)
+                            .opacity(isGenerating ? avatarService.breathOpacity : 1.0)
                     } else {
                         Circle()
                             .fill(agent.avatarColor.opacity(0.15))
@@ -1079,12 +1079,10 @@ struct ChatHeaderView: View {
         ringOpacity = 0
         withAnimation(.easeIn(duration: 0.3)) { ringOpacity = 0.85 }
         withAnimation(.linear(duration: 2.0).repeatForever(autoreverses: false)) { ringShift = 1.0 }
-        withAnimation(.easeInOut(duration: 1.8).repeatForever(autoreverses: true)) { avatarScale = 1.06 }
     }
 
     private func flashOnArrival() {
         withAnimation(.easeOut(duration: 0.15)) { ringWidth = 3.5; ringOpacity = 1.0 }
-        withAnimation(.easeOut(duration: 0.3)) { avatarScale = 1.0 }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
             withAnimation(.easeOut(duration: 0.6)) { ringWidth = 2; ringOpacity = 0 }
             ringShift = 0
@@ -1102,6 +1100,7 @@ struct AvatarPopoverView: View {
     @State private var dnaText: String = ""
     @State private var didSave = false
     @State private var didStarSave = false
+    @State private var popoverRingShift: CGFloat = 0
 
     private let historySize: CGFloat = 44
     var body: some View {
@@ -1125,6 +1124,7 @@ struct AvatarPopoverView: View {
                                     .frame(width: 120, height: 120)
                                     .clipShape(Circle())
                                     .overlay(Circle().stroke(agent.avatarColor.opacity(0.4), lineWidth: 1.5))
+                                    .opacity(isGenerating ? avatarService.breathOpacity : 1.0)
                             } else {
                                 Circle()
                                     .fill(agent.avatarColor.opacity(0.15))
@@ -1135,10 +1135,28 @@ struct AvatarPopoverView: View {
                                             .font(.system(size: 48, weight: .semibold, design: .rounded))
                                             .foregroundColor(agent.avatarColor)
                                     )
+                                    .opacity(isGenerating ? avatarService.breathOpacity : 1.0)
                             }
                             if isGenerating {
                                 Circle().fill(Color.black.opacity(0.45)).frame(width: 120, height: 120)
-                                ProgressView().progressViewStyle(.circular).scaleEffect(0.8)
+                                Circle()
+                                    .strokeBorder(
+                                        AngularGradient(
+                                            stops: [
+                                                .init(color: Color(red: 1.0,  green: 0.55, blue: 0.10), location: 0.00),
+                                                .init(color: Color(red: 1.0,  green: 0.25, blue: 0.55), location: 0.25),
+                                                .init(color: Color(red: 0.95, green: 0.15, blue: 0.65), location: 0.50),
+                                                .init(color: Color(red: 0.30, green: 0.55, blue: 1.00), location: 0.75),
+                                                .init(color: Color(red: 0.40, green: 0.78, blue: 1.00), location: 1.00),
+                                            ],
+                                            center: .center
+                                        ),
+                                        lineWidth: 3
+                                    )
+                                    .rotationEffect(.degrees(popoverRingShift * 360))
+                                    .frame(width: 120, height: 120)
+                                    .shadow(color: Color(red: 0.95, green: 0.15, blue: 0.65).opacity(0.5), radius: 4)
+                                    .shadow(color: Color(red: 0.40, green: 0.78, blue: 1.00).opacity(0.4), radius: 6)
                             }
                         }
 
@@ -1279,6 +1297,15 @@ struct AvatarPopoverView: View {
         .frame(width: 320, alignment: .leading)
         .preferredColorScheme(.dark)
         .onAppear { dnaText = avatarService.agentDNA[agent.id] ?? "" }
+        .onChange(of: isGenerating) { generating in
+            if generating {
+                withAnimation(.linear(duration: 2.0).repeatForever(autoreverses: false)) {
+                    popoverRingShift = 1.0
+                }
+            } else {
+                withAnimation(.easeOut(duration: 0.4)) { popoverRingShift = 0 }
+            }
+        }
     }
 
     private func regenerate() {

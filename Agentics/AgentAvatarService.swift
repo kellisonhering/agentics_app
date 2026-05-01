@@ -20,6 +20,7 @@ class AgentAvatarService: ObservableObject {
     @Published var selectedHistoryIndex: [String: Int]       = [:]
     @Published var generationDisabled:   Set<String>         = []
     @Published var geminiUnavailable:    Bool                = false
+    @Published var breathOpacity:        Double              = 1.0
 
     private var messageCounters: [String: Int] = [:]
 
@@ -77,7 +78,11 @@ class AgentAvatarService: ObservableObject {
     func generate(agentId: String, agentName: String, messages: [Message], workspacePath: String, dna: String, agentConfig: AgentConfig?) async {
         guard !generatingAgents.contains(agentId) else { return }
         generatingAgents.insert(agentId)
-        defer { generatingAgents.remove(agentId) }
+        withAnimation(.easeInOut(duration: 1.4).repeatForever(autoreverses: true)) { breathOpacity = 0.4 }
+        defer {
+            generatingAgents.remove(agentId)
+            withAnimation(.easeOut(duration: 0.3)) { breathOpacity = 1.0 }
+        }
         lastError[agentId] = nil
 
         // Read OpenAI key for DALL-E
@@ -148,13 +153,13 @@ class AgentAvatarService: ObservableObject {
     /// Full prompt: DNA anchors character, Gemini describes mood/atmosphere only.
     private func buildPrompt(dna: String, agentName: String, geminiDescription: String) -> String {
         let base = dna.isEmpty ? "\(agentName), an AI assistant character" : dna
-        return "\(base), \(geminiDescription), single figure, centered, solid color background, no frame, no border, stylized digital painting, soft cinematic lighting, semi-realistic, high quality"
+        return "\(base), \(geminiDescription), single figure, centered, solid color background, no frame, no border, no picture frame, digital illustration, soft cinematic lighting, semi-realistic, high quality"
     }
 
     /// Fallback when Gemini key is missing or call fails.
     private func buildFallbackPrompt(dna: String, agentName: String) -> String {
         let base = dna.isEmpty ? "\(agentName), an AI assistant character" : dna
-        return "\(base), single figure, centered, solid color background, no frame, no border, stylized digital painting, soft warm lighting, semi-realistic, high quality"
+        return "\(base), single figure, centered, solid color background, no frame, no border, no picture frame, digital illustration, soft warm lighting, semi-realistic, high quality"
     }
 
     // MARK: - Basic Mood Detection (Gemini fallback)
