@@ -2,6 +2,7 @@ import SwiftUI
 import CryptoKit
 import Security
 import LocalAuthentication
+import UniformTypeIdentifiers
 
 // MARK: - Glass Style Helper
 
@@ -33,370 +34,6 @@ extension View {
     }
 }
 
-// MARK: - OpenClaw Device Auth
-
-class OpenClawAuth {
-
-    private static let keychainService             = "com.kellisonjames.openclawapp"
-    private static let keychainPrivateKeyAccount   = "device-private-key"
-    private static let keychainDeviceIDAccount     = "device-id"
-
-    static func deviceID() -> String {
-        if let saved = loadFromKeychain(account: keychainDeviceIDAccount) { return saved }
-        let (_, id) = createAndStoreKeypair()
-        return id
-    }
-
-    static func publicKeyHex() -> String? {
-        guard let privateKey = loadPrivateKey() else { return nil }
-        return toBase64URL(privateKey.publicKey.rawRepresentation)
-    }
-
-    static func signChallenge(nonce: String, clientMode: String = "ui", role: String = "operator", scopes: String = "operator.read,operator.write", token: String = "") -> (signature: String, publicKey: String, deviceID: String, signedAtMs: Int)? {
-        guard let privateKey = loadPrivateKey() else {
-            print("[OpenClawAuth] No private key found in Keychain")
-            return nil
-        }
-        let id         = deviceID()
-        let signedAtMs = Int(Date().timeIntervalSince1970 * 1000)
-        let payload    = "v2|\(id)|openclaw-macos|\(clientMode)|\(role)|\(scopes)|\(signedAtMs)|\(token)|\(nonce)"
-        guard let payloadData = payload.data(using: .utf8) else { return nil }
-        do {
-            let signature = try privateKey.signature(for: payloadData)
-            print("[OpenClawAuth] Signed payload: \(payload)")
-            return (
-                signature: toBase64URL(signature),
-                publicKey: toBase64URL(privateKey.publicKey.rawRepresentation),
-                deviceID:  id,
-                signedAtMs: signedAtMs
-            )
-        } catch {
-            print("[OpenClawAuth] Signing failed: \(error)")
-            return nil
-        }
-    }
-
-    @discardableResult
-    private static func createAndStoreKeypair() -> (publicKeyHex: String, deviceID: String) {
-        let privateKey  = Curve25519.Signing.PrivateKey()
-        let pubKeyData  = privateKey.publicKey.rawRepresentation
-        let privKeyData = privateKey.rawRepresentation
-        let hash        = SHA256.hash(data: pubKeyData)
-        let deviceID    = hash.compactMap { String(format: "%02x", $0) }.joined()
-        saveToKeychain(data: privKeyData, account: keychainPrivateKeyAccount)
-        saveToKeychain(string: deviceID,  account: keychainDeviceIDAccount)
-        print("[OpenClawAuth] 🔑 Generated new keypair — DeviceID: \(deviceID.prefix(16))…")
-        return (toHex(pubKeyData), deviceID)
-    }
-
-    private static func loadPrivateKey() -> Curve25519.Signing.PrivateKey? {
-        if let data = loadDataFromKeychain(account: keychainPrivateKeyAccount) {
-            return try? Curve25519.Signing.PrivateKey(rawRepresentation: data)
-        }
-        createAndStoreKeypair()
-        return loadDataFromKeychain(account: keychainPrivateKeyAccount)
-            .flatMap { try? Curve25519.Signing.PrivateKey(rawRepresentation: $0) }
-    }
-
-    private static func saveToKeychain(data: Data, account: String) {
-        let query: [String: Any] = [
-            kSecClass as String:          kSecClassGenericPassword,
-            kSecAttrService as String:    keychainService,
-            kSecAttrAccount as String:    account,
-            kSecValueData as String:      data,
-            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlocked
-        ]
-        SecItemDelete(query as CFDictionary)
-        let status = SecItemAdd(query as CFDictionary, nil)
-        if status != errSecSuccess {
-            print("[OpenClawAuth] ⚠️ Keychain save failed for \(account): \(status)")
-        }
-    }
-
-    private static func saveToKeychain(string: String, account: String) {
-        guard let data = string.data(using: .utf8) else { return }
-        saveToKeychain(data: data, account: account)
-    }
-
-    private static func loadDataFromKeychain(account: String) -> Data? {
-        let query: [String: Any] = [
-            kSecClass as String:       kSecClassGenericPassword,
-            kSecAttrService as String: keychainService,
-            kSecAttrAccount as String: account,
-            kSecReturnData as String:  true,
-            kSecMatchLimit as String:  kSecMatchLimitOne
-        ]
-        var result: AnyObject?
-        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess else { return nil }
-        return result as? Data
-    }
-
-    private static func loadFromKeychain(account: String) -> String? {
-        guard let data = loadDataFromKeychain(account: account) else { return nil }
-        return String(data: data, encoding: .utf8)
-    }
-}
-
-private func toHex(_ data: Data) -> String {
-    data.map { String(format: "%02x", $0) }.joined()
-}
-
-private func toBase64URL(_ data: Data) -> String {
-    data.base64EncodedString()
-        .replacingOccurrences(of: "+", with: "-")
-        .replacingOccurrences(of: "/", with: "_")
-        .replacingOccurrences(of: "=", with: "")
-}
-
-
-// MARK: - OpenClaw WebSocket Manager
-
-class OpenClawWebSocket: NSObject, URLSessionWebSocketDelegate {
-
-    typealias TokenHandler = (String) -> Void
-    typealias ErrorHandler = (String) -> Void
-
-    private let gatewayURL = URL(string: "ws://127.0.0.1:18789")!
-    private let authToken: String
-
-    private var webSocketTask: URLSessionWebSocketTask?
-    private var urlSession: URLSession?
-    private var isConnected = false
-    private var isReady     = false
-
-    private var pendingMessage:      String?
-    private var pendingAgentID:      String?
-    private var pendingTokenHandler: TokenHandler?
-    private var pendingErrorHandler: ErrorHandler?
-
-    private var connectRequestID: String?
-    private var chatRequestID:    String?
-
-    init(authToken: String) {
-        self.authToken = authToken
-        super.init()
-    }
-
-    func send(message: String, agentID: String, onToken: @escaping TokenHandler, onError: @escaping ErrorHandler) {
-        pendingMessage      = message
-        pendingAgentID      = agentID
-        pendingTokenHandler = onToken
-        pendingErrorHandler = onError
-
-        if webSocketTask == nil {
-            connect()
-        } else if isReady {
-            dispatchPendingMessage()
-        }
-    }
-
-    private func connect() {
-        print("[OpenClawWS] 🔌 Connecting…")
-        var request = URLRequest(url: gatewayURL)
-        request.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")
-
-        let config    = URLSessionConfiguration.default
-        urlSession    = URLSession(configuration: config, delegate: self, delegateQueue: .main)
-        webSocketTask = urlSession?.webSocketTask(with: request)
-        webSocketTask?.resume()
-        receiveNextFrame()
-    }
-
-    func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didOpenWithProtocol protocol: String?) {
-        print("[OpenClawWS] ✅ Socket opened — waiting for connect.challenge")
-        isConnected = true
-    }
-
-    func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
-        print("[OpenClawWS] 🔴 Socket closed")
-        isConnected = false
-        isReady     = false
-        self.webSocketTask = nil
-    }
-
-    private func sendConnectRequest(nonce: String, ts: Int) {
-        let reqID = UUID().uuidString
-        connectRequestID = reqID
-
-        guard let signed = OpenClawAuth.signChallenge(
-            nonce:      nonce,
-            clientMode: "ui",
-            role:       "operator",
-            scopes:     "operator.read,operator.write",
-            token:      authToken
-        ) else {
-            pendingErrorHandler?("Failed to sign connect challenge")
-            cleanup(); return
-        }
-
-        sendJSON([
-            "type":   "req",
-            "id":     reqID,
-            "method": "connect",
-            "params": [
-                "minProtocol": 3,
-                "maxProtocol": 3,
-                "client": [
-                    "id":       "openclaw-macos",
-                    "version":  "1.0.0",
-                    "platform": "macos",
-                    "mode":     "ui"
-                ],
-                "role":   "operator",
-                "scopes": ["operator.read", "operator.write"],
-                "auth":   ["token": authToken],
-                "device": [
-                    "id":        signed.deviceID,
-                    "publicKey": signed.publicKey,
-                    "signature": signed.signature,
-                    "signedAt":  signed.signedAtMs,
-                    "nonce":     nonce
-                ]
-            ]
-        ])
-        print("[OpenClawWS] connect req sent with signed device")
-    }
-
-    private func receiveNextFrame() {
-        webSocketTask?.receive { [weak self] result in
-            guard let self else { return }
-            switch result {
-            case .failure(let error):
-                print("[OpenClawWS] ❌ Receive error: \(error)")
-                self.pendingErrorHandler?("Connection error: \(error.localizedDescription)")
-                self.cleanup()
-            case .success(let msg):
-                switch msg {
-                case .string(let text): self.handleFrame(text)
-                case .data(let data):
-                    if let text = String(data: data, encoding: .utf8) { self.handleFrame(text) }
-                @unknown default: break
-                }
-                self.receiveNextFrame()
-            }
-        }
-    }
-
-    private func handleFrame(_ text: String) {
-        guard let data = text.data(using: .utf8),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            print("[OpenClawWS] ⚠️ Unparseable frame: \(text.prefix(200))")
-            return
-        }
-
-        let frameType = json["type"] as? String ?? ""
-        let frameID   = json["id"]   as? String ?? ""
-        print("[OpenClawWS] 📥 type=\(frameType) id=\(frameID.prefix(8))")
-
-        switch frameType {
-
-        case "res":
-            let ok = json["ok"] as? Bool ?? false
-
-            if frameID == connectRequestID {
-                if ok {
-                    print("[OpenClawWS] 🔓 Handshake complete — ready")
-                    isReady = true
-                    dispatchPendingMessage()
-                } else {
-                    let errorObj = json["error"] as? [String: Any]
-                    let reason   = errorObj?["message"] as? String ?? "connect rejected"
-                    print("[OpenClawWS] ❌ Connect failed: \(reason)")
-                    pendingErrorHandler?("Connect failed: \(reason)")
-                    cleanup()
-                }
-            } else if frameID == chatRequestID {
-                if !ok {
-                    let reason = (json["payload"] as? [String: Any])?["reason"] as? String ?? "chat.send failed"
-                    DispatchQueue.main.async { self.pendingErrorHandler?("Chat error: \(reason)") }
-                }
-            }
-
-        case "event":
-            let event   = json["event"]   as? String ?? ""
-            let payload = json["payload"] as? [String: Any]
-            print("[OpenClawWS] Event: \(event.isEmpty ? "(empty)" : event)")
-
-            switch event {
-
-            case "connect.challenge":
-                let nonce = payload?["nonce"] as? String ?? ""
-                let ts    = payload?["ts"]    as? Int    ?? Int(Date().timeIntervalSince1970 * 1000)
-                print("[OpenClawWS] Got challenge nonce: \(nonce.prefix(8))...")
-                sendConnectRequest(nonce: nonce, ts: ts)
-
-            case "agent":
-                let stream = payload?["stream"] as? String ?? ""
-                if stream == "assistant" {
-                    let data  = payload?["data"] as? [String: Any]
-                    let delta = data?["delta"] as? String ?? ""
-                    if !delta.isEmpty {
-                        print("[OpenClawWS] Token: \(delta)")
-                        DispatchQueue.main.async { self.pendingTokenHandler?(delta) }
-                    }
-                }
-
-            case "chat":
-                let state = payload?["state"] as? String ?? ""
-                if state == "final" {
-                    print("[OpenClawWS] Stream complete")
-                    let handler = self.pendingTokenHandler
-                    self.pendingTokenHandler = nil
-                    self.pendingErrorHandler = nil
-                    self.chatRequestID       = nil
-                    DispatchQueue.main.async { handler?("") }
-                }
-
-            case "health", "tick":
-                break
-
-            default:
-                print("[OpenClawWS] Unhandled event: \(event)")
-            }
-
-        default:
-            print("[OpenClawWS] ℹ️ Unhandled frame type: \(frameType)")
-        }
-    }
-
-    private func dispatchPendingMessage() {
-        guard let message = pendingMessage, let agentID = pendingAgentID else { return }
-
-        let reqID = UUID().uuidString
-        chatRequestID = reqID
-
-        sendJSON([
-            "type":   "req",
-            "id":     reqID,
-            "method": "chat.send",
-            "params": [
-                "sessionKey":     "agent:\(agentID):main",
-                "message":        message,
-                "idempotencyKey": UUID().uuidString
-            ]
-        ])
-        print("[OpenClawWS] 📤 chat.send → agent=\(agentID)")
-
-        pendingMessage = nil
-        pendingAgentID = nil
-    }
-
-    private func sendJSON(_ dict: [String: Any]) {
-        guard let data = try? JSONSerialization.data(withJSONObject: dict),
-              let text = String(data: data, encoding: .utf8) else { return }
-        webSocketTask?.send(.string(text)) { error in
-            if let error { print("[OpenClawWS] ❌ Send error: \(error)") }
-        }
-    }
-
-    private func cleanup() {
-        webSocketTask?.cancel(with: .goingAway, reason: nil)
-        webSocketTask = nil
-        isConnected   = false
-        isReady       = false
-    }
-}
-
 // MARK: - OpenClaw JSON Models
 
 struct OpenClawConfig: Codable {
@@ -410,10 +47,6 @@ struct AgentsConfig: Codable {
 
 struct AgentDefaults: Codable {
     let workspace: String
-}
-
-struct AgentHeartbeat: Codable {
-    let every: String
 }
 
 // Handles both string and object shapes for the model field:
@@ -486,11 +119,6 @@ class OpenClawLoader {
         catch { return false }
     }
 
-    func heartbeatMDPath(for agent: AgentConfig, defaults: AgentDefaults) -> String {
-        let workspace = workspacePath(for: agent, defaults: defaults)
-        return (workspace as NSString).appendingPathComponent("HEARTBEAT.md")
-    }
-
     func loadConfig(from path: String) -> OpenClawConfig? {
         let expandedPath = (path as NSString).expandingTildeInPath
         guard let data = FileManager.default.contents(atPath: expandedPath),
@@ -509,16 +137,150 @@ class OpenClawLoader {
         catch { return false }
     }
 
-    func readHeartbeatMD(for agentConfig: AgentConfig, defaults: AgentDefaults) -> String? {
-        let path = (heartbeatMDPath(for: agentConfig, defaults: defaults) as NSString).expandingTildeInPath
-        return try? String(contentsOfFile: path, encoding: .utf8)
+    func readGatewayToken(configPath: String) -> String? {
+        let expandedPath = (configPath as NSString).expandingTildeInPath
+        guard let data = FileManager.default.contents(atPath: expandedPath),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let gateway = json["gateway"] as? [String: Any],
+              let auth = gateway["auth"] as? [String: Any],
+              let token = auth["token"] as? String else { return nil }
+        return token
     }
 
-    func writeHeartbeatMD(content: String, for agentConfig: AgentConfig, defaults: AgentDefaults) -> Bool {
-        let path = (heartbeatMDPath(for: agentConfig, defaults: defaults) as NSString).expandingTildeInPath
-        do { try content.write(toFile: path, atomically: true, encoding: .utf8); return true }
-        catch { return false }
+    func writeGatewayToken(_ token: String, configPath: String) -> Bool {
+        let expandedPath = (configPath as NSString).expandingTildeInPath
+        guard let data = FileManager.default.contents(atPath: expandedPath),
+              var json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              var gateway = json["gateway"] as? [String: Any],
+              var auth = gateway["auth"] as? [String: Any] else { return false }
+        auth["token"] = token
+        gateway["auth"] = auth
+        json["gateway"] = gateway
+        guard let newData = try? JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys]) else { return false }
+        do { try newData.write(to: URL(fileURLWithPath: expandedPath), options: .atomic); return true }
+        catch { print("[KeyStore] Failed to write gateway token: \(error)"); return false }
     }
+
+    func writeAgentModel(_ model: String, agentId: String, configPath: String) -> Bool {
+        let expandedPath = (configPath as NSString).expandingTildeInPath
+        guard let data = FileManager.default.contents(atPath: expandedPath),
+              var json  = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              var agents = json["agents"] as? [String: Any],
+              var list   = agents["list"] as? [[String: Any]] else { return false }
+        guard let idx = list.firstIndex(where: { $0["id"] as? String == agentId }) else { return false }
+        list[idx]["model"] = ["primary": model]
+        agents["list"] = list
+        json["agents"]  = agents
+        guard let newData = try? JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys]) else { return false }
+        do { try newData.write(to: URL(fileURLWithPath: expandedPath), options: .atomic); return true }
+        catch { print("[OpenClawLoader] Failed to write agent model: \(error)"); return false }
+    }
+
+    /// Appends a new agent entry to openclaw.json and returns the workspace path on success.
+    func addAgent(id: String, name: String, model: String, configPath: String) -> (success: Bool, workspacePath: String?) {
+        let expandedPath = (configPath as NSString).expandingTildeInPath
+        guard let data    = FileManager.default.contents(atPath: expandedPath),
+              var json    = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              var agents  = json["agents"] as? [String: Any],
+              var list    = agents["list"] as? [[String: Any]],
+              let defaults        = agents["defaults"] as? [String: Any],
+              let defaultWorkspace = defaults["workspace"] as? String
+        else { return (false, nil) }
+
+        // Reject duplicate IDs
+        if list.contains(where: { $0["id"] as? String == id }) { return (false, nil) }
+
+        let agentWorkspace = (defaultWorkspace as NSString).appendingPathComponent(id)
+
+        let newAgent: [String: Any] = [
+            "id":        id,
+            "name":      name,
+            "workspace": agentWorkspace,
+            "model":     ["primary": model]
+        ]
+
+        list.append(newAgent)
+        agents["list"] = list
+        json["agents"] = agents
+
+        guard let newData = try? JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys]) else { return (false, nil) }
+        do {
+            try newData.write(to: URL(fileURLWithPath: expandedPath), options: .atomic)
+            return (true, agentWorkspace)
+        } catch {
+            print("[OpenClawLoader] Failed to add agent: \(error)")
+            return (false, nil)
+        }
+    }
+
+    /// Removes an agent entry from openclaw.json by ID. Returns true on success.
+    /// Does not touch the agent's workspace files on disk — caller decides what to do with those.
+    func removeAgent(id: String, configPath: String) -> Bool {
+        let expandedPath = (configPath as NSString).expandingTildeInPath
+        guard let data   = FileManager.default.contents(atPath: expandedPath),
+              var json   = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              var agents = json["agents"] as? [String: Any],
+              var list   = agents["list"] as? [[String: Any]]
+        else { return false }
+
+        let countBefore = list.count
+        list.removeAll { $0["id"] as? String == id }
+
+        // If nothing was removed the ID didn't exist — treat as failure
+        guard list.count < countBefore else { return false }
+
+        agents["list"] = list
+        json["agents"] = agents
+
+        guard let newData = try? JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys]) else { return false }
+        do {
+            try newData.write(to: URL(fileURLWithPath: expandedPath), options: .atomic)
+            print("[OpenClawLoader] Removed agent '\(id)' from config")
+            return true
+        } catch {
+            print("[OpenClawLoader] Failed to remove agent '\(id)': \(error)")
+            return false
+        }
+    }
+
+    // MARK: - .env File (global API keys for all agents)
+
+    var dotEnvPath: String = ("~/.openclaw/.env" as NSString).expandingTildeInPath
+
+    private func readDotEnv() -> [String: String] {
+        guard let contents = try? String(contentsOfFile: dotEnvPath, encoding: .utf8) else { return [:] }
+        var result: [String: String] = [:]
+        for line in contents.components(separatedBy: .newlines) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.isEmpty, !trimmed.hasPrefix("#"), let eq = trimmed.firstIndex(of: "=") else { continue }
+            let key = String(trimmed[trimmed.startIndex..<eq])
+            let value = String(trimmed[trimmed.index(after: eq)...])
+            result[key] = value
+        }
+        return result
+    }
+
+    private func writeDotEnv(_ values: [String: String]) -> Bool {
+        var existing = readDotEnv()
+        for (k, v) in values { existing[k] = v }
+        let contents = existing.map { "\($0.key)=\($0.value)" }.sorted().joined(separator: "\n") + "\n"
+        do { try contents.write(toFile: dotEnvPath, atomically: true, encoding: .utf8); return true }
+        catch { print("[KeyStore] Failed to write .env: \(error)"); return false }
+    }
+
+    func readEnvKey(_ name: String) -> String? {
+        let value = readDotEnv()[name]
+        return value?.isEmpty == false ? value : nil
+    }
+
+    func writeEnvKeys(_ keys: [String: String]) -> Bool {
+        writeDotEnv(keys)
+    }
+
+    func readGeminiKey() -> String? { readEnvKey("GOOGLE_API_KEY") }
+    func readAnthropicKey() -> String? { readEnvKey("ANTHROPIC_API_KEY") }
+    func readOpenAIKey() -> String? { readEnvKey("OPENAI_API_KEY") }
+    func readIBMQuantumKey() -> String? { readEnvKey("IBM_QUANTUM_TOKEN") }
 
     func chatJSONPath(for agent: AgentConfig, defaults: AgentDefaults) -> String {
         let workspace = workspacePath(for: agent, defaults: defaults)
@@ -538,65 +300,6 @@ class OpenClawLoader {
         try? data.write(to: URL(fileURLWithPath: path), options: .atomic)
     }
 
-    func updateHeartbeat(agentId: String, interval: String?, configPath: String) -> Bool {
-        let expandedPath = (configPath as NSString).expandingTildeInPath
-        guard var rawJson = try? String(contentsOfFile: expandedPath, encoding: .utf8) else { return false }
-
-        let agentMarker = "\"id\": \"\(agentId)\""
-        guard let markerRange = rawJson.range(of: agentMarker) else { return false }
-
-        var openBraceIdx = rawJson.startIndex
-        var foundOpenBrace = false
-        var backDepth = 0
-        var scanIdx = rawJson.index(before: markerRange.lowerBound)
-        while scanIdx > rawJson.startIndex {
-            let ch = rawJson[scanIdx]
-            if ch == "}" { backDepth += 1 }
-            else if ch == "{" {
-                if backDepth == 0 { openBraceIdx = scanIdx; foundOpenBrace = true; break }
-                backDepth -= 1
-            }
-            scanIdx = rawJson.index(before: scanIdx)
-        }
-        guard foundOpenBrace else { return false }
-
-        var depth = 0
-        var closeIdx = rawJson.endIndex
-        var idx = openBraceIdx
-        while idx < rawJson.endIndex {
-            let ch = rawJson[idx]
-            if ch == "{" { depth += 1 }
-            else if ch == "}" { depth -= 1; if depth == 0 { closeIdx = idx; break } }
-            idx = rawJson.index(after: idx)
-        }
-        guard closeIdx != rawJson.endIndex else { return false }
-
-        var agentBlock = String(rawJson[openBraceIdx...closeIdx])
-
-        if interval == nil {
-            let removePattern = ",?\\s*\"heartbeat\":\\s*\\{[^}]*\\}"
-            if let regex = try? NSRegularExpression(pattern: removePattern),
-               let match = regex.firstMatch(in: agentBlock, range: NSRange(agentBlock.startIndex..., in: agentBlock)),
-               let swiftRange = Range(match.range, in: agentBlock) {
-                agentBlock.removeSubrange(swiftRange)
-            }
-        } else {
-            let heartbeatJson = "\"heartbeat\": { \"every\": \"\(interval!)\" }"
-            let existingPattern = "\"heartbeat\":\\s*\\{[^}]*\\}"
-            if let regex = try? NSRegularExpression(pattern: existingPattern),
-               let match = regex.firstMatch(in: agentBlock, range: NSRange(agentBlock.startIndex..., in: agentBlock)),
-               let swiftRange = Range(match.range, in: agentBlock) {
-                agentBlock.replaceSubrange(swiftRange, with: heartbeatJson)
-            } else {
-                let insertIdx = agentBlock.index(before: agentBlock.endIndex)
-                agentBlock.insert(contentsOf: ",\n        \(heartbeatJson)\n      ", at: insertIdx)
-            }
-        }
-
-        rawJson.replaceSubrange(openBraceIdx...closeIdx, with: agentBlock)
-        do { try rawJson.write(toFile: expandedPath, atomically: true, encoding: .utf8); return true }
-        catch { return false }
-    }
 }
 
 // MARK: - Agent Model
@@ -626,7 +329,7 @@ struct Agent: Identifiable, Hashable {
 }
 
 enum AgentStatus {
-    case idle, thinking, responding, error
+    case idle, thinking, responding, error, restarting
 
     var label: String {
         switch self {
@@ -634,6 +337,7 @@ enum AgentStatus {
         case .thinking:   return "Thinking..."
         case .responding: return "Responding..."
         case .error:      return "Error"
+        case .restarting: return "Restarting..."
         }
     }
 
@@ -643,6 +347,7 @@ enum AgentStatus {
         case .thinking:   return .yellow
         case .responding: return .blue
         case .error:      return .red
+        case .restarting: return .yellow
         }
     }
 
@@ -711,13 +416,31 @@ struct Message: Identifiable, Codable {
     var isUser: Bool
     var timestamp: Date
     var agentName: String?
+    var isSystemNotice: Bool
 
-    init(id: UUID = UUID(), content: String, isUser: Bool, timestamp: Date, agentName: String?) {
-        self.id        = id
-        self.content   = content
-        self.isUser    = isUser
-        self.timestamp = timestamp
-        self.agentName = agentName
+    enum CodingKeys: String, CodingKey {
+        case id, content, isUser, timestamp, agentName, isSystemNotice
+    }
+
+    init(id: UUID = UUID(), content: String, isUser: Bool, timestamp: Date, agentName: String?, isSystemNotice: Bool = false) {
+        self.id             = id
+        self.content        = content
+        self.isUser         = isUser
+        self.timestamp      = timestamp
+        self.agentName      = agentName
+        self.isSystemNotice = isSystemNotice
+    }
+
+    // Custom decoder so existing saved chat history (which has no isSystemNotice field)
+    // loads correctly instead of throwing a decoding error.
+    init(from decoder: Decoder) throws {
+        let container   = try decoder.container(keyedBy: CodingKeys.self)
+        id              = try container.decode(UUID.self,   forKey: .id)
+        content         = try container.decode(String.self, forKey: .content)
+        isUser          = try container.decode(Bool.self,   forKey: .isUser)
+        timestamp       = try container.decode(Date.self,   forKey: .timestamp)
+        agentName       = try container.decodeIfPresent(String.self, forKey: .agentName)
+        isSystemNotice  = (try? container.decodeIfPresent(Bool.self, forKey: .isSystemNotice)) ?? false
     }
 }
 
@@ -730,16 +453,59 @@ class AppState: ObservableObject {
     @Published var configPath: String = "~/.openclaw/openclaw.json"
     @Published var loadError: String? = nil
     @Published var isLoaded: Bool = false
-    @Published var settingsPanelVisible: Bool = false
+    @Published var settingsPanelVisible: Bool = true
     @Published var streamingAgents: Set<String> = []
-    let wsManager = OpenClawWebSocket(
-        authToken: ProcessInfo.processInfo.environment["OPENCLAW_GATEWAY_TOKEN"] ?? ""
-    )
+    let wsManager = OpenClawWebSocket()
 
     private let avatarColors: [Color] = [.purple, .cyan, .orange, .green, .blue, .pink, .yellow]
-    private var agentDefaults: AgentDefaults? = nil
+    var agentDefaults: AgentDefaults? = nil
 
-    init() { loadAgents() }
+    init() {
+        loadAgents()
+        NotificationCenter.default.addObserver(
+            forName: .gatewayDidReconnect,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            print("[AppState] Gateway reconnected — clearing BOOTSTRAP.md for all agents")
+            for agent in self.agents { self.clearBootstrapMD(for: agent) }
+        }
+
+        NotificationCenter.default.addObserver(
+            forName: .gatewayDidInterrupt,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let self,
+                  let agentIds = notification.userInfo?["agentIds"] as? [String] else { return }
+            print("[AppState] Connection interrupted — cleaning up streams for: \(agentIds)")
+            for agentId in agentIds {
+                // Remove any empty streaming bubble left behind — it will never receive content
+                if let lastIdx = self.messages[agentId]?.lastIndex(where: { !$0.isUser && !$0.isSystemNotice }),
+                   self.messages[agentId]?[lastIdx].content.isEmpty == true {
+                    self.messages[agentId]?.remove(at: lastIdx)
+                }
+                // Insert a system notice in place of the lost response
+                let notice = Message(
+                    content: "Connection interrupted\nResponse may be incomplete",
+                    isUser: false,
+                    timestamp: Date(),
+                    agentName: nil,
+                    isSystemNotice: true
+                )
+                self.messages[agentId, default: []].append(notice)
+                // Clean up streaming state so the send button unlocks
+                self.streamingAgents.remove(agentId)
+                if let idx = self.agents.firstIndex(where: { $0.id == agentId }) {
+                    self.agents[idx].status = .idle
+                }
+                if let agent = self.agents.first(where: { $0.id == agentId }) {
+                    self.saveChat(for: agent)
+                }
+            }
+        }
+    }
 
     func loadAgents() {
         loadError = nil
@@ -794,6 +560,7 @@ class AppState: ObservableObject {
         }
 
         isLoaded = true
+        if selectedAgent == nil { selectedAgent = agents.first }
     }
 
     func saveSoulMD(for agent: Agent) -> Bool {
@@ -806,20 +573,84 @@ class AppState: ObservableObject {
         return OpenClawLoader.shared.writeIdentityMD(content: agent.identityContent, for: agentConfig, defaults: defaults)
     }
 
-    func saveHeartbeatMD(for agent: Agent) -> Bool {
-        guard let agentConfig = agent.agentConfig, let defaults = agentDefaults else { return false }
-        return OpenClawLoader.shared.writeHeartbeatMD(content: agent.heartbeatContent, for: agentConfig, defaults: defaults)
-    }
-
     func saveChat(for agent: Agent) {
         guard let agentConfig = agent.agentConfig, let defaults = agentDefaults else { return }
         let msgs = (messages[agent.id] ?? []).suffix(500)
         OpenClawLoader.shared.writeChat(Array(msgs), for: agentConfig, defaults: defaults)
     }
 
-    func saveHeartbeatInterval(for agent: Agent) -> Bool {
-        let interval = agent.heartbeatInterval == "off" ? nil : agent.heartbeatInterval
-        return OpenClawLoader.shared.updateHeartbeat(agentId: agent.id, interval: interval, configPath: configPath)
+    func writeBootstrapMD(content: String, for agent: Agent) {
+        let path = ((agent.workspacePath as NSString).expandingTildeInPath as NSString)
+            .appendingPathComponent("BOOTSTRAP.md")
+        DispatchQueue.global(qos: .utility).async {
+            do { try content.write(toFile: path, atomically: true, encoding: .utf8)
+                print("[AppState] Wrote BOOTSTRAP.md for \(agent.id)") }
+            catch { print("[AppState] Failed to write BOOTSTRAP.md: \(error)") }
+        }
+    }
+
+    func clearBootstrapMD(for agent: Agent) {
+        let path = ((agent.workspacePath as NSString).expandingTildeInPath as NSString)
+            .appendingPathComponent("BOOTSTRAP.md")
+        DispatchQueue.global(qos: .utility).async {
+            do { try "".write(toFile: path, atomically: true, encoding: .utf8)
+                print("[AppState] Cleared BOOTSTRAP.md for \(agent.id)") }
+            catch { print("[AppState] Failed to clear BOOTSTRAP.md: \(error)") }
+        }
+    }
+
+    /// Appends a model-switch summary entry to handoff-log.md in the agent's workspace.
+    /// Creates the file with a header the first time it is called for a given agent.
+    func appendToHandoffLog(summary: String, fromModel: String, toModel: String, for agent: Agent) {
+        let path = ((agent.workspacePath as NSString).expandingTildeInPath as NSString)
+            .appendingPathComponent("handoff-log.md")
+
+        let formatter        = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        let timestamp        = formatter.string(from: Date())
+
+        let entry = """
+
+
+        ---
+
+        ## \(timestamp)
+        From: \(fromModel) → To: \(toModel)
+
+        \(summary)
+        """
+
+        DispatchQueue.global(qos: .utility).async {
+            if !FileManager.default.fileExists(atPath: path) {
+                let header = "# Handoff Log — \(agent.name)\n"
+                do {
+                    try (header + entry).write(toFile: path, atomically: true, encoding: .utf8)
+                    print("[AppState] Created handoff-log.md for \(agent.id)")
+                } catch {
+                    print("[AppState] Failed to create handoff-log.md: \(error)")
+                }
+            } else {
+                if let fileHandle = FileHandle(forWritingAtPath: path) {
+                    fileHandle.seekToEndOfFile()
+                    if let data = entry.data(using: .utf8) { fileHandle.write(data) }
+                    fileHandle.closeFile()
+                    print("[AppState] Appended to handoff-log.md for \(agent.id)")
+                } else {
+                    print("[AppState] Failed to open handoff-log.md for appending")
+                }
+            }
+        }
+    }
+
+    func updateAgentModel(agentId: String, newModel: String) {
+        if let idx = agents.firstIndex(where: { $0.id == agentId }) {
+            agents[idx].role = newModel
+        }
+        if selectedAgent?.id == agentId {
+            selectedAgent?.role = newModel
+        }
+        let success = OpenClawLoader.shared.writeAgentModel(newModel, agentId: agentId, configPath: configPath)
+        print("[AppState] Model update for \(agentId) → \(newModel): \(success ? "saved" : "failed")")
     }
 
     func updateSidebarPreview(for agentId: String) {
@@ -847,15 +678,17 @@ class AppState: ObservableObject {
 
 struct ContentView: View {
     @StateObject var state = AppState()
+    @StateObject var avatarService = AgentAvatarService()
     @State private var showAPIKeyManager = false
 
     var body: some View {
         NavigationSplitView {
-            SidebarView().environmentObject(state)
+            SidebarView().environmentObject(state).environmentObject(avatarService)
         } detail: {
             if let agent = state.selectedAgent {
                 ChatView(agent: binding(for: agent))
                     .environmentObject(state)
+                    .environmentObject(avatarService)
                     .id(agent.id)
             } else {
                 EmptyStateView().environmentObject(state)
@@ -865,10 +698,13 @@ struct ContentView: View {
         .frame(minWidth: 900, minHeight: 600)
         .preferredColorScheme(.dark)
         .sheet(isPresented: $showAPIKeyManager) {
-            APIKeyManagerView().environmentObject(state)
+            APIKeyManagerView().environmentObject(state).environmentObject(avatarService)
         }
         .onReceive(NotificationCenter.default.publisher(for: .showAPIKeyManager)) { _ in
             showAPIKeyManager = true
+        }
+        .task {
+            await avatarService.loadAll(agents: state.agents)
         }
     }
 
@@ -882,7 +718,8 @@ struct ContentView: View {
 
 struct SidebarView: View {
     @EnvironmentObject var state: AppState
-    @State private var searchText = ""
+    @State private var searchText      = ""
+    @State private var showCreateAgent = false
 
     var filteredAgents: [Agent] {
         if searchText.isEmpty { return state.agents }
@@ -894,20 +731,21 @@ struct SidebarView: View {
 
     var body: some View {
         ZStack {
-            Color(red: 0.06, green: 0.06, blue: 0.10).ignoresSafeArea()
+            Color(red: 0.14, green: 0.14, blue: 0.14).ignoresSafeArea()
             VStack(spacing: 0) {
                 HStack {
                     Text("Agentics")
                         .font(.system(size: 18, weight: .bold, design: .rounded))
                         .foregroundColor(.white)
                     Spacer()
-                    Button(action: { state.loadAgents() }) {
-                        Image(systemName: "arrow.clockwise")
-                            .foregroundColor(.blue)
-                            .font(.system(size: 15))
-                    }
-                    .buttonStyle(.plain)
-                    .help("Reload agents from config")
+                    // + button disabled until create agent flow is redesigned
+                    // Button(action: { showCreateAgent = true }) {
+                    //     Image(systemName: "plus")
+                    //         .foregroundColor(Color(red: 1.0, green: 0.25, blue: 0.55))
+                    //         .font(.system(size: 16, weight: .medium))
+                    // }
+                    // .buttonStyle(.plain)
+                    // .help("Add new agent")
                 }
                 .padding(.horizontal, 16)
                 .padding(.vertical, 14)
@@ -945,36 +783,47 @@ struct SidebarView: View {
                         }
                     }
                 }
-
-
             }
         }
         .frame(minWidth: 260, maxWidth: 300)
+        .sheet(isPresented: $showCreateAgent) {
+            CreateAgentSheet().environmentObject(state)
+        }
     }
 }
 
 struct AgentRowView: View {
     let agent: Agent
     @EnvironmentObject var state: AppState
+    @EnvironmentObject var avatarService: AgentAvatarService
     var isSelected: Bool { state.selectedAgent?.id == agent.id }
-    // Read status live from AppState so the dot updates in real time
     var liveStatus: AgentStatus { state.agents.first(where: { $0.id == agent.id })?.status ?? agent.status }
 
     var body: some View {
+        let avatarImage: CGImage? = avatarService.avatarImages[agent.id]
         HStack(spacing: 12) {
             ZStack(alignment: .bottomTrailing) {
-                Circle()
-                    .fill(agent.avatarColor.opacity(0.15))
-                    .frame(width: 46, height: 46)
-                    .overlay(Circle().stroke(agent.avatarColor.opacity(0.3), lineWidth: 1))
-                    .overlay(
-                        Text(String(agent.name.prefix(1)))
-                            .font(.system(size: 18, weight: .semibold, design: .rounded))
-                            .foregroundColor(agent.avatarColor)
-                    )
+                if let cgImage = avatarImage {
+                    Image(cgImage, scale: 1.0, label: Text(agent.name))
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: 46, height: 46)
+                        .clipShape(Circle())
+                        .overlay(Circle().stroke(agent.avatarColor.opacity(0.3), lineWidth: 1))
+                } else {
+                    Circle()
+                        .fill(agent.avatarColor.opacity(0.15))
+                        .frame(width: 46, height: 46)
+                        .overlay(Circle().stroke(agent.avatarColor.opacity(0.3), lineWidth: 1))
+                        .overlay(
+                            Text(String(agent.name.prefix(1)))
+                                .font(.system(size: 18, weight: .semibold, design: .rounded))
+                                .foregroundColor(agent.avatarColor)
+                        )
+                }
                 AgentStatusDot(status: liveStatus, size: 11)
                     .id(liveStatus)
-                    .overlay(Circle().stroke(Color(red: 0.06, green: 0.06, blue: 0.10), lineWidth: 2))
+                    .overlay(Circle().stroke(Color(red: 0.14, green: 0.14, blue: 0.14), lineWidth: 2))
             }
 
             VStack(alignment: .leading, spacing: 3) {
@@ -1002,15 +851,15 @@ struct AgentRowView: View {
                         Text("\(agent.unreadCount)")
                             .font(.system(size: 11, weight: .bold)).foregroundColor(.white)
                             .padding(.horizontal, 6).padding(.vertical, 2)
-                            .background(Color.blue).clipShape(Capsule())
+                            .background(Color(red: 1.0, green: 0.25, blue: 0.55)).clipShape(Capsule())
                     }
                 }
             }
         }
         .padding(.horizontal, 14).padding(.vertical, 10)
-        .background(isSelected ? Color.blue.opacity(0.12) : Color.clear)
+        .background(isSelected ? Color(red: 1.0, green: 0.25, blue: 0.55).opacity(0.12) : Color.clear)
         .overlay(
-            isSelected ? Rectangle().fill(Color.blue.opacity(0.6))
+            isSelected ? Rectangle().fill(Color(red: 1.0, green: 0.25, blue: 0.55).opacity(0.6))
                 .frame(width: 3).frame(maxWidth: .infinity, alignment: .leading) : nil
         )
         .contentShape(Rectangle())
@@ -1023,6 +872,7 @@ struct AgentRowView: View {
 struct ChatView: View {
     @Binding var agent: Agent
     @EnvironmentObject var state: AppState
+    @EnvironmentObject var avatarService: AgentAvatarService
     @State private var inputText = ""
     @State private var scrollProxy: ScrollViewProxy? = nil
     @State private var pendingCompact = false
@@ -1036,13 +886,12 @@ struct ChatView: View {
 
     var body: some View {
         ZStack {
-            LinearGradient(
-                colors: [Color(red: 0.06, green: 0.06, blue: 0.12), Color(red: 0.04, green: 0.04, blue: 0.09)],
-                startPoint: .topLeading, endPoint: .bottomTrailing
-            ).ignoresSafeArea()
+            Color(red: 0.10, green: 0.10, blue: 0.10).ignoresSafeArea()
 
             VStack(spacing: 0) {
-                ChatHeaderView(agent: $agent, onCompact: compactContext).environmentObject(state)
+                ChatHeaderView(agent: $agent, onCompact: compactContext)
+                    .environmentObject(state)
+                    .environmentObject(avatarService)
                 Divider().background(Color.white.opacity(0.08))
 
                 HStack(spacing: 0) {
@@ -1055,18 +904,29 @@ struct ChatView: View {
                                         messages[0...i].filter { $0.isUser == messages[i].isUser }.count - 1
                                     }
                                 )), id: \.0.id) { message, sideIndex in
-                                    let isLastAgentMsg = !message.isUser && message.id == messages.last?.id
-                                    MessageBubbleView(
-                                        message: message,
-                                        agent: agent,
-                                        sideIndex: sideIndex,
-                                        isThinking: isLastAgentMsg && message.content.isEmpty,
-                                        isLatest: isLastAgentMsg && !message.content.isEmpty
-                                    )
-                                    .id(message.id)
-                                    .listRowBackground(Color.clear)
-                                    .listRowSeparator(.hidden)
-                                    .listRowInsets(EdgeInsets(top: 2, leading: 12, bottom: 2, trailing: 12))
+                                    if message.isSystemNotice {
+                                        SystemNoticeView(content: message.content)
+                                            .id(message.id)
+                                            .listRowBackground(Color.clear)
+                                            .listRowSeparator(.hidden)
+                                            .listRowInsets(EdgeInsets(top: 6, leading: 12, bottom: 6, trailing: 12))
+                                    } else {
+                                        let isLastAgentMsg = !message.isUser && message.id == messages.last?.id
+                                        let messageIndex = messages.firstIndex(where: { $0.id == message.id }) ?? 0
+                                        let shouldAnimate = messageIndex >= messages.count - 10
+                                        MessageBubbleView(
+                                            message: message,
+                                            agent: agent,
+                                            sideIndex: sideIndex,
+                                            isThinking: isLastAgentMsg && message.content.isEmpty,
+                                            isLatest: isLastAgentMsg && !message.content.isEmpty,
+                                            shouldAnimate: shouldAnimate
+                                        )
+                                        .id(message.id)
+                                        .listRowBackground(Color.clear)
+                                        .listRowSeparator(.hidden)
+                                        .listRowInsets(EdgeInsets(top: 2, leading: 12, bottom: 2, trailing: 12))
+                                    }
                                 }
                                 Color.clear.frame(height: 1).id("bottom-sentinel")
                                     .listRowBackground(Color.clear)
@@ -1092,11 +952,12 @@ struct ChatView: View {
 
                         InputBarView(inputText: $inputText, agent: $agent, pendingCompact: $pendingCompact)
                             .environmentObject(state)
+                            .environmentObject(avatarService)
                     }
 
                     if state.settingsPanelVisible {
                         Divider().background(Color.white.opacity(0.08))
-                        AgentSettingsPanel(agent: $agent).environmentObject(state)
+                        AgentSettingsPanel(agent: $agent).environmentObject(state).environmentObject(avatarService)
                             .frame(width: 290)
                             .transition(.move(edge: .trailing).combined(with: .opacity))
                     }
@@ -1110,18 +971,70 @@ struct ChatView: View {
 struct ChatHeaderView: View {
     @Binding var agent: Agent
     @EnvironmentObject var state: AppState
+    @EnvironmentObject var avatarService: AgentAvatarService
     var onCompact: (() -> Void)? = nil
 
+    @State private var showAvatarPopover = false
+    @State private var ringShift: CGFloat = 0
+    @State private var ringOpacity: Double = 0
+    @State private var ringWidth: CGFloat = 2
+    @State private var avatarScale: CGFloat = 1.0
+
     var body: some View {
+        let avatarImage: CGImage? = avatarService.avatarImages[agent.id]
+        let isGenerating: Bool    = avatarService.generatingAgents.contains(agent.id)
         HStack(spacing: 12) {
-            Circle()
-                .fill(agent.avatarColor.opacity(0.15)).frame(width: 36, height: 36)
-                .overlay(Circle().stroke(agent.avatarColor.opacity(0.3), lineWidth: 1))
-                .overlay(
-                    Text(String(agent.name.prefix(1)))
-                        .font(.system(size: 14, weight: .bold, design: .rounded))
-                        .foregroundColor(agent.avatarColor)
-                )
+            Button(action: { showAvatarPopover.toggle() }) {
+                ZStack {
+                    if let cgImage = avatarImage {
+                        Image(cgImage, scale: 1.0, label: Text(agent.name))
+                            .resizable()
+                            .scaledToFill()
+                            .frame(width: 56, height: 56)
+                            .clipShape(Circle())
+                            .opacity(isGenerating ? avatarService.breathOpacity : 1.0)
+                    } else {
+                        Circle()
+                            .fill(agent.avatarColor.opacity(0.15))
+                            .frame(width: 56, height: 56)
+                            .overlay(
+                                Text(String(agent.name.prefix(1)))
+                                    .font(.system(size: 20, weight: .bold, design: .rounded))
+                                    .foregroundColor(agent.avatarColor)
+                            )
+                    }
+                    Circle()
+                        .strokeBorder(
+                            AngularGradient(
+                                stops: [
+                                    .init(color: Color(red: 1.0,  green: 0.55, blue: 0.10), location: 0.00),
+                                    .init(color: Color(red: 1.0,  green: 0.25, blue: 0.55), location: 0.25),
+                                    .init(color: Color(red: 0.95, green: 0.15, blue: 0.65), location: 0.50),
+                                    .init(color: Color(red: 0.30, green: 0.55, blue: 1.00), location: 0.75),
+                                    .init(color: Color(red: 0.40, green: 0.78, blue: 1.00), location: 1.00),
+                                ],
+                                center: .center
+                            ),
+                            lineWidth: ringWidth
+                        )
+                        .rotationEffect(.degrees(ringShift * 360))
+                        .frame(width: 56, height: 56)
+                        .opacity(ringOpacity)
+                        .shadow(color: Color(red: 0.95, green: 0.15, blue: 0.65).opacity(0.5), radius: 4)
+                        .shadow(color: Color(red: 0.40, green: 0.78, blue: 1.00).opacity(0.4), radius: 6)
+                        .allowsHitTesting(false)
+                }
+            }
+            .buttonStyle(.plain)
+            .help("Edit avatar DNA")
+            .popover(isPresented: $showAvatarPopover, arrowEdge: .bottom) {
+                AvatarPopoverView(agent: $agent)
+                    .environmentObject(state)
+                    .environmentObject(avatarService)
+            }
+            .onChange(of: isGenerating) { generating in
+                if generating { startPulse() } else { flashOnArrival() }
+            }
 
             VStack(alignment: .leading, spacing: 1) {
                 Text(agent.name).font(.system(size: 14, weight: .semibold)).foregroundColor(.white)
@@ -1151,511 +1064,261 @@ struct ChatHeaderView: View {
             Button(action: { withAnimation { state.settingsPanelVisible.toggle() } }) {
                 Image(systemName: "slider.horizontal.3")
                     .font(.system(size: 15))
-                    .foregroundColor(state.settingsPanelVisible ? .blue : Color.white.opacity(0.5))
+                    .foregroundColor(state.settingsPanelVisible ? Color(red: 1.0, green: 0.25, blue: 0.55) : Color.white.opacity(0.5))
                     .padding(7)
                     .glassBackground(opacity: state.settingsPanelVisible ? 0.2 : 0.08, cornerRadius: 8, borderOpacity: 0.15)
             }
             .buttonStyle(.plain).padding(.leading, 4)
         }
-        .padding(.horizontal, 18).padding(.vertical, 12)
+        .padding(.horizontal, 18).padding(.vertical, 8)
         .background(.ultraThinMaterial)
     }
-}
 
-// MARK: - Message Bubbles
+    private func startPulse() {
+        ringWidth   = 2
+        ringOpacity = 0
+        withAnimation(.easeIn(duration: 0.3)) { ringOpacity = 0.85 }
+        withAnimation(.linear(duration: 2.0).repeatForever(autoreverses: false)) { ringShift = 1.0 }
+    }
 
-struct AnimatedGradientBubble: View {
-    let isUser: Bool
-    let index: Int
-    var isThinking: Bool = false
-    var isLatest: Bool = false
-    @State private var shift: CGFloat = 0
-
-    var body: some View {
-        let dir: (UnitPoint, UnitPoint) = (index % 2 == 0)
-            ? (UnitPoint(x: 0, y: 0.5), UnitPoint(x: 1, y: 0.5))
-            : (UnitPoint(x: 1, y: 0.5), UnitPoint(x: 0, y: 0.5))
-        ZStack {
-            if isUser {
-                BubbleShape(isUser: true)
-                    .fill(LinearGradient(
-                        stops: [
-                            .init(color: Color(red: 1.0,  green: 0.55, blue: 0.10).opacity(0.90), location: max(0, min(1, -0.125 + shift))),
-                            .init(color: Color(red: 1.0,  green: 0.25, blue: 0.55).opacity(0.90), location: max(0, min(1,  0.125 + shift))),
-                            .init(color: Color(red: 0.95, green: 0.15, blue: 0.65).opacity(0.90), location: max(0, min(1,  0.375 + shift))),
-                            .init(color: Color(red: 0.30, green: 0.55, blue: 1.00).opacity(0.90), location: max(0, min(1,  0.625 + shift))),
-                            .init(color: Color(red: 0.40, green: 0.78, blue: 1.00).opacity(0.88), location: max(0, min(1,  0.875 + shift))),
-                        ],
-                        startPoint: dir.0, endPoint: dir.1
-                    ))
-                BubbleShape(isUser: true).fill(.ultraThinMaterial.opacity(0.08))
-                BubbleShape(isUser: true).stroke(
-                    LinearGradient(
-                        colors: [Color.white.opacity(0.55), Color.white.opacity(0.15)],
-                        startPoint: .topLeading, endPoint: .bottomTrailing
-                    ), lineWidth: 0.7)
-            } else {
-                BubbleShape(isUser: false)
-                    .fill(LinearGradient(
-                        stops: [
-                            .init(color: Color(red: 1.0,  green: 0.55, blue: 0.10).opacity(0.16), location: max(0, min(1, -0.125 + shift))),
-                            .init(color: Color(red: 1.0,  green: 0.25, blue: 0.55).opacity(0.16), location: max(0, min(1,  0.125 + shift))),
-                            .init(color: Color(red: 0.95, green: 0.15, blue: 0.65).opacity(0.14), location: max(0, min(1,  0.375 + shift))),
-                            .init(color: Color(red: 0.30, green: 0.55, blue: 1.00).opacity(0.16), location: max(0, min(1,  0.625 + shift))),
-                            .init(color: Color(red: 0.40, green: 0.78, blue: 1.00).opacity(0.16), location: max(0, min(1,  0.875 + shift))),
-                        ],
-                        startPoint: dir.0, endPoint: dir.1
-                    ))
-                BubbleShape(isUser: false).fill(.ultraThinMaterial.opacity(0.55))
-                BubbleShape(isUser: false).stroke(
-                    LinearGradient(
-                        stops: [
-                            .init(color: Color(red: 1.0,  green: 0.55, blue: 0.10).opacity(0.40), location: max(0, min(1, -0.125 + shift))),
-                            .init(color: Color(red: 0.95, green: 0.15, blue: 0.65).opacity(0.35), location: max(0, min(1,  0.375 + shift))),
-                            .init(color: Color(red: 0.40, green: 0.78, blue: 1.00).opacity(0.35), location: max(0, min(1,  0.875 + shift))),
-                        ],
-                        startPoint: dir.0, endPoint: dir.1
-                    ), lineWidth: 0.6)
-                if isThinking || isLatest {
-                    let gleamOpacity: Double = isThinking ? 0.92 : 0.45
-                    let gleamWidth: CGFloat  = isThinking ? 1.5  : 0.9
-                    let glowOpacity: Double  = isThinking ? 0.5  : 0.2
-                    BubbleShape(isUser: false).stroke(
-                        LinearGradient(
-                            stops: [
-                                .init(color: Color(red: 1.0,  green: 0.55, blue: 0.10).opacity(gleamOpacity), location: max(0, min(1, -0.125 + shift))),
-                                .init(color: Color(red: 1.0,  green: 0.25, blue: 0.55).opacity(gleamOpacity), location: max(0, min(1,  0.125 + shift))),
-                                .init(color: Color(red: 0.95, green: 0.15, blue: 0.65).opacity(gleamOpacity), location: max(0, min(1,  0.375 + shift))),
-                                .init(color: Color(red: 0.30, green: 0.55, blue: 1.00).opacity(gleamOpacity), location: max(0, min(1,  0.625 + shift))),
-                                .init(color: Color(red: 0.40, green: 0.78, blue: 1.00).opacity(gleamOpacity), location: max(0, min(1,  0.875 + shift))),
-                            ],
-                            startPoint: dir.0, endPoint: dir.1
-                        ), lineWidth: gleamWidth)
-                    .shadow(color: Color(red: 0.95, green: 0.15, blue: 0.65).opacity(glowOpacity), radius: 4)
-                    .shadow(color: Color(red: 0.40, green: 0.78, blue: 1.00).opacity(glowOpacity * 0.8), radius: 6)
-                    .transition(.opacity.animation(.easeInOut(duration: 0.3)))
-                }
-            }
-        }
-        .onAppear {
-            guard shift == 0 else { return }
-            let delay = Double(index % 8) * 0.45
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-                withAnimation(.easeInOut(duration: isThinking ? 0.6 : 3.0).repeatForever(autoreverses: true)) {
-                    shift = 0.25
-                }
-            }
-        }
-        .onChange(of: isThinking) { thinking in
-            shift = 0
-            withAnimation(.easeInOut(duration: thinking ? 0.6 : 3.0).repeatForever(autoreverses: true)) {
-                shift = 0.25
-            }
+    private func flashOnArrival() {
+        withAnimation(.easeOut(duration: 0.15)) { ringWidth = 3.5; ringOpacity = 1.0 }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            withAnimation(.easeOut(duration: 0.6)) { ringWidth = 2; ringOpacity = 0 }
+            ringShift = 0
         }
     }
 }
 
-struct MessageBubbleView: View {
-    let message: Message
-    let agent: Agent
-    let sideIndex: Int
-    var isThinking: Bool = false
-    var isLatest: Bool = false
+// MARK: - Avatar Popover
 
-    func markdownText(_ string: String) -> Text {
-        if var attributed = try? AttributedString(
-            markdown: string,
-            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
-        ) {
-            // Style links with app pink color and underline
-            for run in attributed.runs {
-                if run.link != nil {
-                    attributed[run.range].foregroundColor = Color(red: 1.0, green: 0.25, blue: 0.55)
-                    attributed[run.range].underlineStyle = .single
-                }
-            }
-            return Text(attributed)
-        }
-        return Text(string)
-    }
-
-    var body: some View {
-        HStack(alignment: .bottom, spacing: 8) {
-            if message.isUser {
-                Spacer(minLength: 60)
-                VStack(alignment: .trailing, spacing: 3) {
-                    markdownText(message.content)
-                        .font(.system(size: 13)).foregroundColor(.white)
-                        .textSelection(.enabled)
-                        .padding(.horizontal, 12).padding(.vertical, 7)
-                        .background(AnimatedGradientBubble(isUser: true, index: sideIndex))
-                    Text(timeString(message.timestamp)).font(.system(size: 10)).foregroundColor(Color.white.opacity(0.3))
-                }
-            } else {
-                Circle().fill(agent.avatarColor.opacity(0.15)).frame(width: 28, height: 28)
-                    .overlay(Circle().stroke(agent.avatarColor.opacity(0.3), lineWidth: 0.5))
-                    .overlay(Text(String(agent.name.prefix(1))).font(.system(size: 11, weight: .bold)).foregroundColor(agent.avatarColor))
-
-                VStack(alignment: .leading, spacing: 3) {
-                    markdownText(message.content.isEmpty ? " " : message.content)
-                        .font(.system(size: 13)).foregroundColor(.white)
-                        .textSelection(.enabled)
-                        .padding(.horizontal, 12).padding(.vertical, 7)
-                        .background(AnimatedGradientBubble(isUser: false, index: sideIndex, isThinking: isThinking, isLatest: isLatest))
-                    Text(timeString(message.timestamp)).font(.system(size: 10)).foregroundColor(Color.white.opacity(0.3))
-                }
-                Spacer(minLength: 60)
-            }
-        }
-        .padding(.vertical, 2)
-    }
-
-    func timeString(_ date: Date) -> String {
-        let f = DateFormatter(); f.timeStyle = .short; return f.string(from: date)
-    }
-}
-
-struct BubbleShape: Shape {
-    let isUser: Bool
-    func path(in rect: CGRect) -> Path {
-        let r: CGFloat = 12; let smallR: CGFloat = 3; var path = Path()
-        if isUser {
-            path.move(to: CGPoint(x: rect.minX + r, y: rect.minY))
-            path.addLine(to: CGPoint(x: rect.maxX - r, y: rect.minY))
-            path.addArc(center: CGPoint(x: rect.maxX - r, y: rect.minY + r), radius: r, startAngle: .degrees(-90), endAngle: .degrees(0), clockwise: false)
-            path.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY - smallR))
-            path.addArc(center: CGPoint(x: rect.maxX - smallR, y: rect.maxY - smallR), radius: smallR, startAngle: .degrees(0), endAngle: .degrees(90), clockwise: false)
-            path.addLine(to: CGPoint(x: rect.minX + r, y: rect.maxY))
-            path.addArc(center: CGPoint(x: rect.minX + r, y: rect.maxY - r), radius: r, startAngle: .degrees(90), endAngle: .degrees(180), clockwise: false)
-            path.addLine(to: CGPoint(x: rect.minX, y: rect.minY + r))
-            path.addArc(center: CGPoint(x: rect.minX + r, y: rect.minY + r), radius: r, startAngle: .degrees(180), endAngle: .degrees(270), clockwise: false)
-        } else {
-            path.move(to: CGPoint(x: rect.minX + r, y: rect.minY))
-            path.addLine(to: CGPoint(x: rect.maxX - r, y: rect.minY))
-            path.addArc(center: CGPoint(x: rect.maxX - r, y: rect.minY + r), radius: r, startAngle: .degrees(-90), endAngle: .degrees(0), clockwise: false)
-            path.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY - r))
-            path.addArc(center: CGPoint(x: rect.maxX - r, y: rect.maxY - r), radius: r, startAngle: .degrees(0), endAngle: .degrees(90), clockwise: false)
-            path.addLine(to: CGPoint(x: rect.minX + smallR, y: rect.maxY))
-            path.addArc(center: CGPoint(x: rect.minX + smallR, y: rect.maxY - smallR), radius: smallR, startAngle: .degrees(90), endAngle: .degrees(180), clockwise: false)
-            path.addLine(to: CGPoint(x: rect.minX, y: rect.minY + r))
-            path.addArc(center: CGPoint(x: rect.minX + r, y: rect.minY + r), radius: r, startAngle: .degrees(180), endAngle: .degrees(270), clockwise: false)
-        }
-        path.closeSubpath(); return path
-    }
-}
-
-
-// MARK: - Input Bar
-
-struct AnimatedSendButton: View {
-    @State private var shift: CGFloat = 0
-
-    var body: some View {
-        ZStack {
-            Capsule()
-                .fill(LinearGradient(
-                    stops: [
-                        .init(color: Color(red: 1.0,  green: 0.55, blue: 0.10).opacity(0.90), location: max(0, 0.00 - shift)),
-                        .init(color: Color(red: 1.0,  green: 0.25, blue: 0.55).opacity(0.90), location: max(0, min(1, 0.25 - shift))),
-                        .init(color: Color(red: 0.95, green: 0.15, blue: 0.65).opacity(0.90), location: max(0, min(1, 0.50 - shift))),
-                        .init(color: Color(red: 0.30, green: 0.55, blue: 1.00).opacity(0.90), location: max(0, min(1, 0.75 - shift))),
-                        .init(color: Color(red: 0.40, green: 0.78, blue: 1.00).opacity(0.88), location: min(1, 1.00 - shift)),
-                    ],
-                    startPoint: .bottomLeading,
-                    endPoint: .topTrailing
-                ))
-                .frame(width: 32, height: 26)
-            Image(systemName: "arrow.up")
-                .font(.system(size: 13, weight: .heavy))
-                .foregroundColor(.white)
-        }
-        .onAppear {
-            withAnimation(.easeInOut(duration: 3.0).repeatForever(autoreverses: true)) {
-                shift = 0.30
-            }
-        }
-    }
-}
-
-struct InputBarView: View {
-    @Binding var inputText: String
+struct AvatarPopoverView: View {
     @Binding var agent: Agent
-    @Binding var pendingCompact: Bool
     @EnvironmentObject var state: AppState
-    @State private var pastedContent: String? = nil
+    @EnvironmentObject var avatarService: AgentAvatarService
 
-    var isStreaming: Bool { state.streamingAgents.contains(agent.id) }
+    @State private var dnaText: String = ""
+    @State private var didSave = false
+    @State private var didStarSave = false
+    @State private var popoverRingShift: CGFloat = 0
 
-    // Returns the name of a different agent that is currently streaming, if any
-    var otherStreamingAgentName: String? {
-        guard let streaming = state.streamingAgents.first(where: { $0 != agent.id }) else { return nil }
-        return state.agents.first(where: { $0.id == streaming })?.name
-    }
-
+    private let historySize: CGFloat = 44
     var body: some View {
-        VStack(spacing: 0) {
-            if let otherName = otherStreamingAgentName {
-                HStack(spacing: 6) {
-                    TypingIndicator()
-                    Text("\(otherName) is responding. Please wait…")
-                        .font(.system(size: 11))
-                        .foregroundColor(Color.white.opacity(0.35))
-                    Spacer()
-                }
-                .padding(.horizontal, 20)
-                .padding(.bottom, 6)
-            } else if isStreaming {
-                HStack(spacing: 6) {
-                    TypingIndicator()
-                    Text("\(agent.name) is thinking…")
-                        .font(.system(size: 11))
-                        .foregroundColor(Color.white.opacity(0.35))
-                    Spacer()
-                }
-                .padding(.horizontal, 20)
-                .padding(.bottom, 6)
-            }
+        let avatarImage: CGImage? = avatarService.avatarImages[agent.id]
+        let isGenerating: Bool    = avatarService.generatingAgents.contains(agent.id)
+        let history: [CGImage]    = avatarService.avatarHistory[agent.id] ?? []
+        let selectedIdx: Int      = avatarService.selectedHistoryIndex[agent.id] ?? 0
+        let workspacePath: String = (agent.workspacePath as NSString).expandingTildeInPath
 
-            if let pasted = pastedContent {
-                let lineCount = pasted.components(separatedBy: .newlines).count
-                HStack(spacing: 8) {
-                    Image(systemName: "doc.text.fill")
-                        .font(.system(size: 11))
-                        .foregroundColor(.blue)
-                    Text("Pasted text • \(lineCount) lines")
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundColor(Color.white.opacity(0.7))
+        VStack(alignment: .leading, spacing: 14) {
+
+                // Main avatar preview + star button
+                HStack {
                     Spacer()
-                    Button(action: { pastedContent = nil }) {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 10, weight: .semibold))
-                            .foregroundColor(Color.white.opacity(0.4))
+                    VStack(spacing: 10) {
+                        ZStack {
+                            if let cgImage = avatarImage {
+                                Image(cgImage, scale: 1.0, label: Text(agent.name))
+                                    .resizable()
+                                    .scaledToFill()
+                                    .frame(width: 120, height: 120)
+                                    .clipShape(Circle())
+                                    .overlay(Circle().stroke(agent.avatarColor.opacity(0.4), lineWidth: 1.5))
+                                    .opacity(isGenerating ? avatarService.breathOpacity : 1.0)
+                            } else {
+                                Circle()
+                                    .fill(agent.avatarColor.opacity(0.15))
+                                    .frame(width: 120, height: 120)
+                                    .overlay(Circle().stroke(agent.avatarColor.opacity(0.3), lineWidth: 1.5))
+                                    .overlay(
+                                        Text(String(agent.name.prefix(1)))
+                                            .font(.system(size: 48, weight: .semibold, design: .rounded))
+                                            .foregroundColor(agent.avatarColor)
+                                    )
+                                    .opacity(isGenerating ? avatarService.breathOpacity : 1.0)
+                            }
+                            if isGenerating {
+                                Circle().fill(Color.black.opacity(0.45)).frame(width: 120, height: 120)
+                                Circle()
+                                    .strokeBorder(
+                                        AngularGradient(
+                                            stops: [
+                                                .init(color: Color(red: 1.0,  green: 0.55, blue: 0.10), location: 0.00),
+                                                .init(color: Color(red: 1.0,  green: 0.25, blue: 0.55), location: 0.25),
+                                                .init(color: Color(red: 0.95, green: 0.15, blue: 0.65), location: 0.50),
+                                                .init(color: Color(red: 0.30, green: 0.55, blue: 1.00), location: 0.75),
+                                                .init(color: Color(red: 0.40, green: 0.78, blue: 1.00), location: 1.00),
+                                            ],
+                                            center: .center
+                                        ),
+                                        lineWidth: 3
+                                    )
+                                    .rotationEffect(.degrees(popoverRingShift * 360))
+                                    .frame(width: 120, height: 120)
+                                    .shadow(color: Color(red: 0.95, green: 0.15, blue: 0.65).opacity(0.5), radius: 4)
+                                    .shadow(color: Color(red: 0.40, green: 0.78, blue: 1.00).opacity(0.4), radius: 6)
+                            }
+                        }
+
+                        // Star button to permanently save
+                        if avatarImage != nil {
+                            Button(action: {
+                                avatarService.savePermanently(agentId: agent.id, workspacePath: workspacePath)
+                                didStarSave = true
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 2) { didStarSave = false }
+                            }) {
+                                HStack(spacing: 4) {
+                                    Image(systemName: didStarSave ? "star.fill" : "star")
+                                        .font(.system(size: 12))
+                                        .foregroundColor(didStarSave ? Color(red: 1.0, green: 0.80, blue: 0.20) : Color.white.opacity(0.4))
+                                    Text(didStarSave ? "Saved!" : "Save permanently")
+                                        .font(.system(size: 11))
+                                        .foregroundColor(didStarSave ? Color(red: 1.0, green: 0.80, blue: 0.20) : Color.white.opacity(0.4))
+                                }
+                            }
+                            .buttonStyle(.plain)
+                        }
+
+                        // History strip — last 5 generated images
+                        if !history.isEmpty {
+                            HStack(spacing: 8) {
+                                ForEach(0..<min(history.count, 5), id: \.self) { i in
+                                    let isSelected = i == selectedIdx
+                                    Button(action: {
+                                        avatarService.selectHistory(agentId: agent.id, index: i, workspacePath: workspacePath)
+                                    }) {
+                                        ZStack {
+                                            Image(history[i], scale: 1.0, label: Text("History \(i)"))
+                                                .resizable()
+                                                .scaledToFill()
+                                                .frame(width: historySize, height: historySize)
+                                                .clipShape(Circle())
+
+                                            if isSelected {
+                                                Circle()
+                                                    .strokeBorder(
+                                                        Color(red: 1.0, green: 0.25, blue: 0.55).opacity(0.7),
+                                                        lineWidth: 2.5
+                                                    )
+                                                    .frame(width: historySize, height: historySize)
+                                                    .shadow(color: Color(red: 1.0, green: 0.25, blue: 0.55).opacity(0.5), radius: 4)
+                                            } else {
+                                                Circle()
+                                                    .strokeBorder(Color.white.opacity(0.15), lineWidth: 1)
+                                                    .frame(width: historySize, height: historySize)
+                                            }
+                                        }
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                        }
+                    }
+                    Spacer()
+                }
+
+                HStack(spacing: 8) {
+                    Text("Avatar generation")
+                        .font(.system(size: 12)).foregroundColor(.white)
+                    Toggle("", isOn: Binding(
+                        get: { avatarService.isGenerationEnabled(for: agent.id) },
+                        set: { avatarService.setGeneration(enabled: $0, for: agent.id) }
+                    ))
+                    .toggleStyle(.switch)
+                    .tint(Color(red: 1.0, green: 0.25, blue: 0.55))
+                    .scaleEffect(0.75)
+                    .frame(width: 40)
+                }
+
+                if avatarService.geminiUnavailable {
+                    HStack(spacing: 4) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 9))
+                            .foregroundColor(.orange)
+                        Text("Using basic mood detection")
+                            .font(.system(size: 10))
+                            .foregroundColor(.orange)
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 5) {
+                    Label("Avatar DNA", systemImage: "sparkles")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(Color.white.opacity(0.45))
+
+                    TextEditor(text: $dnaText)
+                        .font(.system(size: 12))
+                        .foregroundColor(.white)
+                        .scrollContentBackground(.hidden)
+                        .padding(8)
+                        .frame(height: 72)
+                        .glassBackground(opacity: 0.08, cornerRadius: 8, borderOpacity: 0.15)
+
+                    if let error = avatarService.lastError[agent.id] {
+                        HStack(alignment: .top, spacing: 5) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .font(.system(size: 10)).foregroundColor(.orange)
+                            Text(error)
+                                .font(.system(size: 10)).foregroundColor(.orange)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    } else {
+                        Text("Describe your agent's look. Example: \"glowing teal robot with kind eyes, friendly cartoon style\"")
+                            .font(.system(size: 10))
+                            .foregroundColor(Color.white.opacity(0.25))
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+
+                HStack {
+                    if didSave {
+                        HStack(spacing: 5) {
+                            Image(systemName: "checkmark.circle.fill").foregroundColor(.green).font(.system(size: 11))
+                            Text("Generating…").font(.system(size: 11)).foregroundColor(.green)
+                        }
+                    }
+                    Spacer()
+                    Button(action: regenerate) {
+                        HStack(spacing: 5) {
+                            Image(systemName: "arrow.triangle.2.circlepath").font(.system(size: 11))
+                            Text("Save & Regenerate").font(.system(size: 12, weight: .semibold))
+                        }
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 14).padding(.vertical, 7)
+                        .background(isGenerating ? Color.gray.opacity(0.4) : Color(red: 1.0, green: 0.25, blue: 0.55).opacity(0.7))
+                        .cornerRadius(8)
+                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.white.opacity(0.15), lineWidth: 0.5))
                     }
                     .buttonStyle(.plain)
+                    .disabled(isGenerating)
                 }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .glassBackground(opacity: 0.10, cornerRadius: 10, borderOpacity: 0.15)
-                .padding(.horizontal, 14)
-                .padding(.bottom, 6)
-                .transition(.move(edge: .bottom).combined(with: .opacity))
             }
-
-            HStack(alignment: .bottom, spacing: 0) {
-                TextField("Message \(agent.name)...", text: $inputText, axis: .vertical)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 13))
-                    .foregroundColor(.white)
-                    .lineLimit(1...5)
-                    .onSubmit { sendMessage() }
-                    .padding(.horizontal, 13)
-                    .padding(.top, 6)
-                    .padding(.bottom, 10)
-                    .onChange(of: inputText) { newValue in
-                        let lines = newValue.components(separatedBy: .newlines)
-                        if lines.count > 10 {
-                            pastedContent = newValue
-                            inputText = ""
-                        } else if newValue.count > 80000 {
-                            inputText = String(newValue.prefix(80000))
-                        }
-                    }
-
-                Button(action: sendMessage) {
-                    AnimatedSendButton()
-                        .opacity((inputText.isEmpty && pastedContent == nil || isStreaming || otherStreamingAgentName != nil) ? 0 : 1)
+            .padding(18)
+        .frame(width: 320, alignment: .leading)
+        .preferredColorScheme(.dark)
+        .onAppear { dnaText = avatarService.agentDNA[agent.id] ?? "" }
+        .onChange(of: isGenerating) { generating in
+            if generating {
+                withAnimation(.linear(duration: 2.0).repeatForever(autoreverses: false)) {
+                    popoverRingShift = 1.0
                 }
-                .buttonStyle(.plain)
-                .padding(.trailing, 4)
-                .padding(.top, 4)
-                .padding(.bottom, 4)
-                .allowsHitTesting((!inputText.isEmpty || pastedContent != nil) && !isStreaming && otherStreamingAgentName == nil)
+            } else {
+                withAnimation(.easeOut(duration: 0.4)) { popoverRingShift = 0 }
             }
-            .background(
-                RoundedRectangle(cornerRadius: 20)
-                    .fill(.ultraThinMaterial)
-                    .overlay(RoundedRectangle(cornerRadius: 20).stroke(Color.white.opacity(0.15), lineWidth: 0.5))
-            )
-        }
-        .padding(.horizontal, 14)
-        .padding(.bottom, 16)
-        .padding(.top, 8)
-        .animation(.easeInOut(duration: 0.2), value: pastedContent != nil)
-        .onChange(of: pendingCompact) { pending in
-            if pending { pendingCompact = false; sendMessage() }
         }
     }
 
-    func sendMessage() {
-        let trimmed = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
-        let hasPasted = pastedContent != nil
-
-        guard (!trimmed.isEmpty || hasPasted), !isStreaming, otherStreamingAgentName == nil else { return }
-
-        var fullContent = trimmed
-        if let pasted = pastedContent {
-            let pastedBlock = "[Pasted content]\n\(pasted)"
-            fullContent = trimmed.isEmpty ? pastedBlock : "\(trimmed)\n\n\(pastedBlock)"
-        }
-
-        let displayContent: String = {
-            if let pasted = pastedContent {
-                let lineCount = pasted.components(separatedBy: .newlines).count
-                let preview = trimmed.isEmpty ? "📄 Pasted text • \(lineCount) lines" : "\(trimmed)\n📄 Pasted text • \(lineCount) lines"
-                return preview
-            }
-            return trimmed
-        }()
-
-        let userMsg = Message(content: displayContent, isUser: true, timestamp: Date(), agentName: nil)
-        if state.messages[agent.id] == nil { state.messages[agent.id] = [] }
-        state.messages[agent.id]?.append(userMsg)
-        state.updateSidebarPreview(for: agent.id)
-
-        inputText     = ""
-        pastedContent = nil
-        state.streamingAgents.insert(agent.id)
-
-        DispatchQueue.main.async {
-            if let idx = self.state.agents.firstIndex(where: { $0.id == agent.id }) {
-                self.state.agents[idx].status = .thinking
-            }
-        }
-
-        let agentId       = agent.id
-        let agentName     = agent.name
-        let messageToSend = fullContent
-
-        Task {
-            await streamResponse(agentId: agentId, agentName: agentName, message: messageToSend)
-        }
-    }
-
-    func streamResponse(agentId: String, agentName: String, message: String) async {
-        let replyId     = UUID()
-        let placeholder = Message(id: replyId, content: "", isUser: false, timestamp: Date(), agentName: agentName)
-        state.messages[agentId]?.append(placeholder)
-
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            var resumed     = false
-            var buffer      = ""
-            var displayLink: Timer?
-            var idleTimer:   Timer?
-
-            func updateUIForCompletion() {
-                if let idx = self.state.agents.firstIndex(where: { $0.id == agentId }) {
-                    self.state.agents[idx].status = .idle
-                }
-                self.state.updateSidebarPreview(for: agentId)
-            }
-
-            func resetIdleTimer() {
-                idleTimer?.invalidate()
-                idleTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: false) { _ in
-                    DispatchQueue.main.async {
-                        if let idx = self.state.agents.firstIndex(where: { $0.id == agentId }),
-                           self.state.agents[idx].status == .responding {
-                            self.state.agents[idx].status = .idle
-                        }
-                        self.state.updateSidebarPreview(for: agentId)
-                    }
-                }
-            }
-
-            func flush() {
-                guard !buffer.isEmpty else { return }
-                let charsPerTick = buffer.count > 20 ? 8 : 3
-                let chunk = String(buffer.prefix(charsPerTick))
-                buffer = String(buffer.dropFirst(chunk.count))
-                guard let idx = self.state.messages[agentId]?.firstIndex(where: { $0.id == replyId }) else { return }
-                self.state.messages[agentId]?[idx].content += chunk
-            }
-
-            func finish() {
-                guard !resumed else { return }
-                resumed = true
-                idleTimer?.invalidate()
-                idleTimer = nil
-                displayLink?.invalidate()
-                displayLink = nil
-                if !buffer.isEmpty {
-                    let remaining = buffer
-                    buffer = ""
-                    if let idx = self.state.messages[agentId]?.firstIndex(where: { $0.id == replyId }) {
-                        self.state.messages[agentId]?[idx].content += remaining
-                    }
-                }
-                DispatchQueue.main.async {
-                    self.state.streamingAgents.remove(agentId)
-                    updateUIForCompletion()
-                    if let agent = self.state.agents.first(where: { $0.id == agentId }) {
-                        self.state.saveChat(for: agent)
-                    }
-                    continuation.resume()
-                }
-            }
-
-            let dl = Timer.scheduledTimer(withTimeInterval: 1.0/60.0, repeats: true) { _ in flush() }
-            displayLink = dl
-
-            state.wsManager.send(
-                message: message,
-                agentID: agentId,
-
-                onToken: { token in
-                    if token.isEmpty {
-                        DispatchQueue.main.async {
-                            updateUIForCompletion()
-                            finish()
-                        }
-                        return
-                    }
-                    DispatchQueue.main.async {
-                        buffer += token
-                        if let idx = self.state.agents.firstIndex(where: { $0.id == agentId }),
-                           self.state.agents[idx].status == .thinking {
-                            self.state.agents[idx].status = .responding
-                        }
-                        if let idx = self.state.agents.firstIndex(where: { $0.id == agentId }),
-                           self.state.agents[idx].status == .responding {
-                            resetIdleTimer()
-                        }
-                    }
-                },
-
-                onError: { errorMessage in
-                    DispatchQueue.main.async {
-                        guard let idx = self.state.messages[agentId]?.firstIndex(where: { $0.id == replyId }) else { return }
-                        self.state.messages[agentId]?[idx].content = "⚠️ \(errorMessage)"
-                        finish()
-                    }
-                }
-            )
-        }
-    }
-}
-
-struct TypingIndicator: View {
-    @State private var phase = 0
-    let timer = Timer.publish(every: 0.4, on: .main, in: .common).autoconnect()
-
-    var body: some View {
-        HStack(spacing: 3) {
-            ForEach(0..<3) { i in
-                Circle()
-                    .fill(Color.white.opacity(phase == i ? 0.8 : 0.25))
-                    .frame(width: 5, height: 5)
-            }
-        }
-        .onReceive(timer) { _ in
-            withAnimation(.easeInOut(duration: 0.2)) { phase = (phase + 1) % 3 }
-        }
+    private func regenerate() {
+        guard !avatarService.generatingAgents.contains(agent.id) else { return }
+        didSave = true
+        let messages = state.messages[agent.id] ?? []
+        avatarService.regenerate(for: agent, messages: messages, dna: dnaText)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { didSave = false }
     }
 }
 
 // MARK: - Personality Matrix
 
-// Reusable markdown file editor sheet
 struct MarkdownEditorSheet: View {
     let title: String
     let filePath: String
@@ -1691,7 +1354,7 @@ struct MarkdownEditorSheet: View {
 
     var body: some View {
         ZStack {
-            Color(red: 0.06, green: 0.06, blue: 0.12).ignoresSafeArea()
+            Color(red: 0.14, green: 0.14, blue: 0.14).ignoresSafeArea()
             VStack(alignment: .leading, spacing: 16) {
                 HStack {
                     Label(title, systemImage: "cpu")
@@ -1706,7 +1369,7 @@ struct MarkdownEditorSheet: View {
                     Button("Save") { saveChanges() }
                         .font(.system(size: 13, weight: .semibold)).foregroundColor(.white)
                         .padding(.horizontal, 14).padding(.vertical, 6)
-                        .background(hasChanges ? Color.blue.opacity(0.8) : Color.white.opacity(0.1))
+                        .background(hasChanges ? Color(red: 1.0, green: 0.25, blue: 0.55).opacity(0.8) : Color.white.opacity(0.1))
                         .cornerRadius(8).overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.white.opacity(0.15), lineWidth: 0.5))
                         .buttonStyle(.plain).disabled(!hasChanges)
                 }
@@ -1744,7 +1407,6 @@ struct PersonalityMatrixView: View {
                 .font(.system(size: 11, weight: .medium)).foregroundColor(Color.white.opacity(0.5))
 
             VStack(alignment: .leading, spacing: 6) {
-                // Identity row
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Agent Identity")
@@ -1756,13 +1418,12 @@ struct PersonalityMatrixView: View {
                     Spacer()
                     Button(action: { showIdentityEditor = true }) {
                         Label(agent.identityMDFound ? "Edit" : "Create", systemImage: agent.identityMDFound ? "pencil" : "plus")
-                            .font(.system(size: 11, weight: .medium)).foregroundColor(.blue)
+                            .font(.system(size: 11, weight: .medium)).foregroundColor(Color(red: 1.0, green: 0.25, blue: 0.55))
                     }.buttonStyle(.plain)
                 }
                 .padding(.horizontal, 10).padding(.vertical, 8)
                 .glassBackground(opacity: 0.08, cornerRadius: 8, borderOpacity: 0.12)
 
-                // Soul row
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Agent Soul")
@@ -1774,7 +1435,7 @@ struct PersonalityMatrixView: View {
                     Spacer()
                     Button(action: { showSoulEditor = true }) {
                         Label(agent.soulMDFound ? "Edit" : "Create", systemImage: agent.soulMDFound ? "pencil" : "plus")
-                            .font(.system(size: 11, weight: .medium)).foregroundColor(.blue)
+                            .font(.system(size: 11, weight: .medium)).foregroundColor(Color(red: 1.0, green: 0.25, blue: 0.55))
                     }.buttonStyle(.plain)
                 }
                 .padding(.horizontal, 10).padding(.vertical, 8)
@@ -1810,188 +1471,13 @@ struct PersonalityMatrixView: View {
     }
 }
 
-// MARK: - Heartbeat Editor
-
-struct HeartbeatEditorView: View {
-    @Binding var agent: Agent
-    @EnvironmentObject var state: AppState
-    @State private var selectedInterval: String = ""
-    @State private var customInterval: String   = ""
-    @State private var showCustomField = false
-    @State private var intervalSaved   = false
-
-    let presets = ["30m", "1h", "2h", "4h", "6h", "12h", "24h", "Custom"]
-
-    func saveInterval() {
-        let interval: String
-        if showCustomField {
-            interval = customInterval.trimmingCharacters(in: .whitespaces)
-            guard !interval.isEmpty else { return }
-        } else if selectedInterval.isEmpty {
-            interval = "off"
-        } else {
-            interval = selectedInterval
-        }
-        agent.heartbeatInterval = interval
-        let success = state.saveHeartbeatInterval(for: agent)
-        if success {
-            intervalSaved = true
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { intervalSaved = false }
-        }
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Label("Heartbeat", systemImage: "heart.fill")
-                .font(.system(size: 11, weight: .medium)).foregroundColor(Color.white.opacity(0.5))
-
-            VStack(alignment: .leading, spacing: 10) {
-                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: 4), spacing: 6) {
-                    ForEach(presets, id: \.self) { preset in
-                        Button(action: {
-                            selectedInterval = preset
-                            showCustomField  = preset == "Custom"
-                        }) {
-                            Text(preset)
-                                .font(.system(size: 11, weight: .medium))
-                                .foregroundColor(selectedInterval == preset ? .white : Color.white.opacity(0.5))
-                                .padding(.vertical, 6)
-                                .frame(maxWidth: .infinity)
-                                .background(selectedInterval == preset ? Color.blue.opacity(0.6) : Color.white.opacity(0.06))
-                                .cornerRadius(6)
-                                .overlay(RoundedRectangle(cornerRadius: 6).stroke(
-                                    selectedInterval == preset ? Color.blue.opacity(0.8) : Color.white.opacity(0.1),
-                                    lineWidth: 0.5))
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-
-                if showCustomField {
-                    TextField("e.g. 2h, 45m", text: $customInterval)
-                        .textFieldStyle(.plain).font(.system(size: 12)).foregroundColor(.white)
-                        .padding(.horizontal, 10).padding(.vertical, 6)
-                        .glassBackground(opacity: 0.08, cornerRadius: 6, borderOpacity: 0.15)
-                }
-
-                HStack {
-                    if intervalSaved {
-                        HStack(spacing: 4) {
-                            Image(systemName: "checkmark.circle.fill").foregroundColor(.green).font(.system(size: 11))
-                            Text("Saved").font(.system(size: 11)).foregroundColor(.green)
-                        }
-                    } else {
-                        Text("Currently: \(agent.heartbeatInterval == "off" ? "Off" : agent.heartbeatInterval)")
-                            .font(.system(size: 10)).foregroundColor(Color.white.opacity(0.25))
-                    }
-                    Spacer()
-                    Button(action: saveInterval) {
-                        Text("Apply")
-                            .font(.system(size: 11, weight: .semibold)).foregroundColor(.white)
-                            .padding(.horizontal, 14).padding(.vertical, 5)
-                            .background(Color.blue.opacity(0.6)).cornerRadius(6)
-                            .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.white.opacity(0.15), lineWidth: 0.5))
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-            .padding(10).frame(maxWidth: .infinity)
-            .glassBackground(opacity: 0.08, cornerRadius: 8, borderOpacity: 0.12)
-        }
-        .onAppear { syncToAgent() }
-        .onChange(of: agent.id) { _ in syncToAgent() }
-        .onChange(of: agent.heartbeatInterval) { _ in syncToAgent() }
-    }
-
-    func syncToAgent() {
-        intervalSaved = false
-        let current   = agent.heartbeatInterval
-        if current == "off" || current.isEmpty {
-            selectedInterval = ""; customInterval = ""; showCustomField = false
-        } else if presets.contains(current) {
-            selectedInterval = current; customInterval = ""; showCustomField = false
-        } else {
-            selectedInterval = "Custom"; customInterval = current; showCustomField = true
-        }
-    }
-}
-
-// MARK: - Agent Settings Panel
-
-struct AgentSettingsPanel: View {
-    @Binding var agent: Agent
-    @EnvironmentObject var state: AppState
-
-    var body: some View {
-        ZStack {
-            Color(red: 0.06, green: 0.06, blue: 0.12).ignoresSafeArea()
-            ScrollView {
-                VStack(alignment: .leading, spacing: 20) {
-                    Text("Agent Settings")
-                        .font(.system(size: 15, weight: .semibold)).foregroundColor(.white).padding(.top, 4)
-
-                    VStack(alignment: .leading, spacing: 6) {
-                        Label("Model", systemImage: "cpu")
-                            .font(.system(size: 11, weight: .medium)).foregroundColor(Color.white.opacity(0.5))
-                        Text(agent.role).font(.system(size: 13)).foregroundColor(.white)
-                            .padding(.horizontal, 10).padding(.vertical, 8)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .glassBackground(opacity: 0.08, cornerRadius: 8, borderOpacity: 0.12)
-                    }
-
-                    VStack(alignment: .leading, spacing: 6) {
-                        Label("Workspace", systemImage: "folder")
-                            .font(.system(size: 11, weight: .medium)).foregroundColor(Color.white.opacity(0.5))
-                        Text(agent.workspacePath).font(.system(size: 11)).foregroundColor(Color.white.opacity(0.5))
-                            .padding(.horizontal, 10).padding(.vertical, 8)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .glassBackground(opacity: 0.08, cornerRadius: 8, borderOpacity: 0.12)
-                    }
-
-                    PersonalityMatrixView(agent: $agent).environmentObject(state)
-                    HeartbeatEditorView(agent: $agent).environmentObject(state)
-
-                    VStack(alignment: .leading, spacing: 6) {
-                        Label("Activity", systemImage: "chart.bar.fill")
-                            .font(.system(size: 11, weight: .medium)).foregroundColor(Color.white.opacity(0.5))
-                        VStack(alignment: .leading, spacing: 6) {
-                            ActivityLogRow(icon: "circle.fill", color: agent.status.color, text: agent.status.label)
-                            ActivityLogRow(icon: "folder",      color: Color.white.opacity(0.3), text: agent.soulMDFound ? "Personality Matrix loaded" : "Personality Matrix missing")
-                            ActivityLogRow(icon: "heart",       color: .pink, text: agent.heartbeatMDFound ? "Heartbeat loaded" : "Heartbeat not configured")
-                            ActivityLogRow(icon: "message",     color: .blue, text: "\(state.messages[agent.id]?.count ?? 0) messages this session")
-                        }
-                        .padding(10)
-                        .glassBackground(opacity: 0.08, cornerRadius: 8, borderOpacity: 0.12)
-                    }
-
-                    Spacer()
-                }
-                .padding(16)
-            }
-        }
-    }
-}
-
-struct ActivityLogRow: View {
-    let icon: String; let color: Color; let text: String
-    var body: some View {
-        HStack(spacing: 8) {
-            Image(systemName: icon).font(.system(size: 9)).foregroundColor(color).frame(width: 14)
-            Text(text).font(.system(size: 12)).foregroundColor(Color.white.opacity(0.4))
-        }
-    }
-}
-
 // MARK: - Empty State
 
 struct EmptyStateView: View {
     @EnvironmentObject var state: AppState
     var body: some View {
         ZStack {
-            LinearGradient(
-                colors: [Color(red: 0.06, green: 0.06, blue: 0.12), Color(red: 0.04, green: 0.04, blue: 0.09)],
-                startPoint: .topLeading, endPoint: .bottomTrailing
-            ).ignoresSafeArea()
+            Color(red: 0.10, green: 0.10, blue: 0.10).ignoresSafeArea()
             VStack(spacing: 14) {
                 Image(systemName: "bubble.left.and.bubble.right")
                     .font(.system(size: 48)).foregroundColor(Color.white.opacity(0.15))
@@ -2007,23 +1493,32 @@ struct EmptyStateView: View {
     }
 }
 
-
 // MARK: - API Key Manager
 
 struct APIKeyManagerView: View {
     @EnvironmentObject var state: AppState
+    @EnvironmentObject var avatarService: AgentAvatarService
     @Environment(\.dismiss) var dismiss
 
     @State private var anthropicKey: String = ""
     @State private var openAIKey: String = ""
+    @State private var geminiKey: String = ""
+    @State private var ibmQuantumKey: String = ""
+    @State private var gatewayToken: String = ""
     @State private var saveStatus: String? = nil
     @State private var isError: Bool = false
     @State private var anthropicRevealed: Bool = false
     @State private var openAIRevealed: Bool = false
+    @State private var geminiRevealed: Bool = false
+    @State private var ibmRevealed: Bool = false
+    @State private var gatewayRevealed: Bool = false
+    @State private var isRestarting: Bool = false
 
-    // Check for env variable conflicts
     var anthropicEnvConflict: Bool { ProcessInfo.processInfo.environment["ANTHROPIC_API_KEY"] != nil }
     var openAIEnvConflict: Bool { ProcessInfo.processInfo.environment["OPENAI_API_KEY"] != nil }
+    var geminiEnvConflict: Bool { ProcessInfo.processInfo.environment["GOOGLE_API_KEY"] != nil }
+    var ibmEnvConflict: Bool { ProcessInfo.processInfo.environment["IBM_QUANTUM_TOKEN"] != nil }
+    var gatewayEnvConflict: Bool { ProcessInfo.processInfo.environment["OPENCLAW_GATEWAY_TOKEN"] != nil }
 
     func authenticate(completion: @escaping (Bool) -> Void) {
         let context = LAContext()
@@ -2032,266 +1527,227 @@ struct APIKeyManagerView: View {
             context.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, localizedReason: "Reveal API key") { success, _ in
                 DispatchQueue.main.async { completion(success) }
             }
-        } else {
-            // No biometrics available — fall back to allowing reveal
-            completion(true)
-        }
+        } else { completion(true) }
     }
 
     var body: some View {
         ZStack {
-            Color(red: 0.06, green: 0.06, blue: 0.12).ignoresSafeArea()
-            VStack(alignment: .leading, spacing: 24) {
-                HStack {
-                    Text("API Keys")
-                        .font(.system(size: 18, weight: .bold, design: .rounded))
-                        .foregroundColor(.white)
-                    Spacer()
-                    Button("Done") { dismiss() }
-                        .font(.system(size: 13))
-                        .foregroundColor(Color.white.opacity(0.5))
-                        .buttonStyle(.plain)
-                }
-
-                Text("Keys are saved to each agent's auth-profiles.json and will be used the next time the gateway loads credentials.")
-                    .font(.system(size: 11))
-                    .foregroundColor(Color.white.opacity(0.35))
-                    .fixedSize(horizontal: false, vertical: true)
-
-                // Env variable conflict warning
-                if anthropicEnvConflict || openAIEnvConflict {
-                    HStack(alignment: .top, spacing: 8) {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .foregroundColor(.orange)
-                            .font(.system(size: 12))
-                            .padding(.top, 1)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Environment variable conflict detected")
-                                .font(.system(size: 12, weight: .semibold))
-                                .foregroundColor(.orange)
-                            Text("\(anthropicEnvConflict && openAIEnvConflict ? "ANTHROPIC_API_KEY and OPENAI_API_KEY are" : anthropicEnvConflict ? "ANTHROPIC_API_KEY is" : "OPENAI_API_KEY is") set in your shell environment and may override the keys saved here. Remove \(anthropicEnvConflict && openAIEnvConflict ? "them" : "it") from ~/.zshrc to avoid conflicts.")
-                                .font(.system(size: 11))
-                                .foregroundColor(Color.orange.opacity(0.8))
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                    }
-                    .padding(10)
-                    .glassBackground(opacity: 0.06, cornerRadius: 8, borderOpacity: 0.25)
-                }
-
-                // Anthropic
-                VStack(alignment: .leading, spacing: 8) {
+            Color(red: 0.14, green: 0.14, blue: 0.14).ignoresSafeArea()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 24) {
                     HStack {
-                        Label("Anthropic", systemImage: "brain")
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundColor(Color.white.opacity(0.5))
-                        if anthropicEnvConflict {
-                            Text("ENV OVERRIDE ACTIVE")
-                                .font(.system(size: 9, weight: .bold))
-                                .foregroundColor(.orange)
-                                .padding(.horizontal, 5)
-                                .padding(.vertical, 2)
-                                .background(Color.orange.opacity(0.15))
-                                .cornerRadius(4)
-                        }
-                    }
-                    HStack(spacing: 8) {
-                        Group {
-                            if anthropicRevealed {
-                                TextField("sk-ant-...", text: $anthropicKey)
-                            } else {
-                                SecureField("sk-ant-...", text: $anthropicKey)
-                            }
-                        }
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 13))
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 10)
-                        .glassBackground(opacity: 0.08, cornerRadius: 8, borderOpacity: anthropicEnvConflict ? 0.4 : 0.15)
-
-                        Button(action: {
-                            if anthropicRevealed {
-                                anthropicRevealed = false
-                            } else {
-                                authenticate { success in
-                                    if success { anthropicRevealed = true }
-                                }
-                            }
-                        }) {
-                            Image(systemName: anthropicRevealed ? "eye.slash" : "eye")
-                                .font(.system(size: 13))
-                                .foregroundColor(Color.white.opacity(0.4))
-                                .frame(width: 32, height: 32)
-                                .glassBackground(opacity: 0.08, cornerRadius: 8, borderOpacity: 0.12)
-                        }
-                        .buttonStyle(.plain)
-                        .help(anthropicRevealed ? "Hide key" : "Reveal key with Touch ID")
-                    }
-                }
-
-                // OpenAI
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        Label("OpenAI", systemImage: "sparkles")
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundColor(Color.white.opacity(0.5))
-                        if openAIEnvConflict {
-                            Text("ENV OVERRIDE ACTIVE")
-                                .font(.system(size: 9, weight: .bold))
-                                .foregroundColor(.orange)
-                                .padding(.horizontal, 5)
-                                .padding(.vertical, 2)
-                                .background(Color.orange.opacity(0.15))
-                                .cornerRadius(4)
-                        }
-                    }
-                    HStack(spacing: 8) {
-                        Group {
-                            if openAIRevealed {
-                                TextField("sk-proj-...", text: $openAIKey)
-                            } else {
-                                SecureField("sk-proj-...", text: $openAIKey)
-                            }
-                        }
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 13))
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 10)
-                        .glassBackground(opacity: 0.08, cornerRadius: 8, borderOpacity: openAIEnvConflict ? 0.4 : 0.15)
-
-                        Button(action: {
-                            if openAIRevealed {
-                                openAIRevealed = false
-                            } else {
-                                authenticate { success in
-                                    if success { openAIRevealed = true }
-                                }
-                            }
-                        }) {
-                            Image(systemName: openAIRevealed ? "eye.slash" : "eye")
-                                .font(.system(size: 13))
-                                .foregroundColor(Color.white.opacity(0.4))
-                                .frame(width: 32, height: 32)
-                                .glassBackground(opacity: 0.08, cornerRadius: 8, borderOpacity: 0.12)
-                        }
-                        .buttonStyle(.plain)
-                        .help(openAIRevealed ? "Hide key" : "Reveal key with Touch ID")
-                    }
-                }
-
-                if let status = saveStatus {
-                    HStack(spacing: 6) {
-                        Image(systemName: isError ? "xmark.circle.fill" : "checkmark.circle.fill")
-                            .foregroundColor(isError ? .red : .green)
-                            .font(.system(size: 12))
-                        Text(status)
-                            .font(.system(size: 12))
-                            .foregroundColor(isError ? .red : .green)
-                    }
-                }
-
-                HStack {
-                    Spacer()
-                    Button(action: saveKeys) {
-                        Text("Save Keys")
-                            .font(.system(size: 13, weight: .semibold))
+                        Text("API Keys")
+                            .font(.system(size: 18, weight: .bold, design: .rounded))
                             .foregroundColor(.white)
-                            .padding(.horizontal, 20)
-                            .padding(.vertical, 8)
-                            .background(Color.blue.opacity(0.7))
-                            .cornerRadius(8)
-                            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.white.opacity(0.15), lineWidth: 0.5))
+                        Spacer()
+                        Button("Done") { dismiss() }
+                            .font(.system(size: 13))
+                            .foregroundColor(Color.white.opacity(0.5))
+                            .buttonStyle(.plain)
                     }
-                    .buttonStyle(.plain)
-                    .disabled(anthropicKey.isEmpty && openAIKey.isEmpty)
-                }
 
-                Spacer()
+                    Text("API keys are saved globally to ~/.openclaw/.env and apply to all agents. The gateway token is saved to openclaw.json. Changes take effect after restart.")
+                        .font(.system(size: 11))
+                        .foregroundColor(Color.white.opacity(0.35))
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    // Env conflict warning
+                    let conflicts = [
+                        anthropicEnvConflict ? "ANTHROPIC_API_KEY" : nil,
+                        openAIEnvConflict    ? "OPENAI_API_KEY"    : nil,
+                        geminiEnvConflict    ? "GOOGLE_API_KEY"    : nil,
+                        ibmEnvConflict       ? "IBM_QUANTUM_TOKEN" : nil,
+                        gatewayEnvConflict   ? "OPENCLAW_GATEWAY_TOKEN" : nil
+                    ].compactMap { $0 }
+
+                    if !conflicts.isEmpty {
+                        HStack(alignment: .top, spacing: 8) {
+                            Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.orange).font(.system(size: 12)).padding(.top, 1)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Environment variable conflict detected").font(.system(size: 12, weight: .semibold)).foregroundColor(.orange)
+                                Text("\(conflicts.joined(separator: ", ")) \(conflicts.count == 1 ? "is" : "are") set in your shell environment and may override values saved here.")
+                                    .font(.system(size: 11)).foregroundColor(Color.orange.opacity(0.8)).fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
+                        .padding(10).glassBackground(opacity: 0.06, cornerRadius: 8, borderOpacity: 0.25)
+                    }
+
+                    // Anthropic
+                    keyField(label: "Anthropic", icon: "brain", placeholder: "sk-ant-...", key: $anthropicKey, revealed: $anthropicRevealed, hasConflict: anthropicEnvConflict)
+
+                    // OpenAI
+                    keyField(label: "OpenAI", icon: "sparkles", placeholder: "sk-proj-...", key: $openAIKey, revealed: $openAIRevealed, hasConflict: openAIEnvConflict)
+
+                    // Gemini
+                    keyField(label: "Gemini (Avatar Generation)", icon: "camera.filters", placeholder: "AIza...", key: $geminiKey, revealed: $geminiRevealed, hasConflict: geminiEnvConflict)
+
+                    // IBM Quantum
+                    keyField(label: "IBM Quantum", icon: "atom", placeholder: "IBM Quantum API token", key: $ibmQuantumKey, revealed: $ibmRevealed, hasConflict: ibmEnvConflict)
+
+                    if !geminiKey.isEmpty && avatarService.geminiUnavailable {
+                        HStack(spacing: 5) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .font(.system(size: 10))
+                                .foregroundColor(.orange)
+                            Text("Gemini quota exceeded — using basic mood detection")
+                                .font(.system(size: 10))
+                                .foregroundColor(.orange)
+                        }
+                        .padding(.top, -4)
+                    }
+
+                    // Gateway Token
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Label("Gateway Token", systemImage: "lock.shield").font(.system(size: 11, weight: .medium)).foregroundColor(Color.white.opacity(0.5))
+                            if gatewayEnvConflict {
+                                Text("ENV OVERRIDE ACTIVE").font(.system(size: 9, weight: .bold)).foregroundColor(.orange)
+                                    .padding(.horizontal, 5).padding(.vertical, 2).background(Color.orange.opacity(0.15)).cornerRadius(4)
+                            }
+                        }
+                        HStack(spacing: 8) {
+                            Group {
+                                if gatewayRevealed { TextField("Gateway auth token...", text: $gatewayToken) }
+                                else { SecureField("Gateway auth token...", text: $gatewayToken) }
+                            }
+                            .textFieldStyle(.plain).font(.system(size: 13)).foregroundColor(.white)
+                            .padding(.horizontal, 12).padding(.vertical, 10)
+                            .glassBackground(opacity: 0.08, cornerRadius: 8, borderOpacity: gatewayEnvConflict ? 0.4 : 0.15)
+
+                            Button(action: { if gatewayRevealed { gatewayRevealed = false } else { authenticate { if $0 { gatewayRevealed = true } } } }) {
+                                Image(systemName: gatewayRevealed ? "eye.slash" : "eye").font(.system(size: 13)).foregroundColor(Color.white.opacity(0.4))
+                                    .frame(width: 32, height: 32).glassBackground(opacity: 0.08, cornerRadius: 8, borderOpacity: 0.12)
+                            }.buttonStyle(.plain).help(gatewayRevealed ? "Hide token" : "Reveal token with Touch ID")
+
+                            Button(action: {
+                                authenticate { success in
+                                    guard success else { return }
+                                    var bytes = [UInt8](repeating: 0, count: 24)
+                                    _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+                                    gatewayToken = bytes.map { String(format: "%02x", $0) }.joined()
+                                    gatewayRevealed = true
+                                }
+                            }) {
+                                Image(systemName: "arrow.triangle.2.circlepath").font(.system(size: 13)).foregroundColor(Color.white.opacity(0.4))
+                                    .frame(width: 32, height: 32).glassBackground(opacity: 0.08, cornerRadius: 8, borderOpacity: 0.12)
+                            }.buttonStyle(.plain).help("Generate new token")
+                        }
+                    }
+
+                    if let status = saveStatus {
+                        HStack(spacing: 6) {
+                            Image(systemName: isError ? "xmark.circle.fill" : "checkmark.circle.fill").foregroundColor(isError ? .red : .green).font(.system(size: 12))
+                            Text(status).font(.system(size: 12)).foregroundColor(isError ? .red : .green)
+                        }
+                    }
+
+                    HStack {
+                        Spacer()
+                        Button(action: saveKeys) {
+                            HStack(spacing: 6) {
+                                if isRestarting { ProgressView().scaleEffect(0.6).frame(width: 12, height: 12) }
+                                Text(isRestarting ? "Restarting..." : "Save Keys").font(.system(size: 13, weight: .semibold)).foregroundColor(.white)
+                            }
+                            .padding(.horizontal, 20).padding(.vertical, 8)
+                            .background(Color(red: 1.0, green: 0.25, blue: 0.55).opacity(0.7)).cornerRadius(8)
+                            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.white.opacity(0.15), lineWidth: 0.5))
+                        }
+                        .buttonStyle(.plain)
+                        .disabled((anthropicKey.isEmpty && openAIKey.isEmpty && geminiKey.isEmpty && ibmQuantumKey.isEmpty && gatewayToken.isEmpty) || isRestarting)
+                    }
+                }
+                .padding(28)
             }
-            .padding(28)
         }
-        .frame(width: 420, height: 360)
+        .frame(width: 420, height: 560)
         .preferredColorScheme(.dark)
         .onAppear { loadCurrentKeys() }
-        .onDisappear {
-            anthropicRevealed = false
-            openAIRevealed = false
+        .onDisappear { anthropicRevealed = false; openAIRevealed = false; geminiRevealed = false; ibmRevealed = false; gatewayRevealed = false }
+    }
+
+    @ViewBuilder
+    func keyField(label: String, icon: String, placeholder: String, key: Binding<String>, revealed: Binding<Bool>, hasConflict: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label(label, systemImage: icon).font(.system(size: 11, weight: .medium)).foregroundColor(Color.white.opacity(0.5))
+                if hasConflict {
+                    Text("ENV OVERRIDE ACTIVE").font(.system(size: 9, weight: .bold)).foregroundColor(.orange)
+                        .padding(.horizontal, 5).padding(.vertical, 2).background(Color.orange.opacity(0.15)).cornerRadius(4)
+                }
+            }
+            HStack(spacing: 8) {
+                Group {
+                    if revealed.wrappedValue { TextField(placeholder, text: key) }
+                    else { SecureField(placeholder, text: key) }
+                }
+                .textFieldStyle(.plain).font(.system(size: 13)).foregroundColor(.white)
+                .padding(.horizontal, 12).padding(.vertical, 10)
+                .glassBackground(opacity: 0.08, cornerRadius: 8, borderOpacity: hasConflict ? 0.4 : 0.15)
+
+                Button(action: { if revealed.wrappedValue { revealed.wrappedValue = false } else { authenticate { if $0 { revealed.wrappedValue = true } } } }) {
+                    Image(systemName: revealed.wrappedValue ? "eye.slash" : "eye").font(.system(size: 13)).foregroundColor(Color.white.opacity(0.4))
+                        .frame(width: 32, height: 32).glassBackground(opacity: 0.08, cornerRadius: 8, borderOpacity: 0.12)
+                }.buttonStyle(.plain).help(revealed.wrappedValue ? "Hide key" : "Reveal key with Touch ID")
+            }
         }
     }
 
     func loadCurrentKeys() {
-        // Load existing keys from the first agent that has them
-        for agent in state.agents {
-            guard let agentConfig = agent.agentConfig else { continue }
-            let agentDir = agentConfig.agentDir ?? ""
-            let path = (agentDir as NSString).appendingPathComponent("auth-profiles.json")
-            let expandedPath = (path as NSString).expandingTildeInPath
-            guard let data = FileManager.default.contents(atPath: expandedPath),
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let profiles = json["profiles"] as? [String: Any] else { continue }
-            if anthropicKey.isEmpty, let p = profiles["anthropic:default"] as? [String: Any], let key = p["key"] as? String {
-                anthropicKey = key
-            }
-            if openAIKey.isEmpty, let p = profiles["openai:default"] as? [String: Any], let key = p["key"] as? String {
-                openAIKey = key
-            }
-            if !anthropicKey.isEmpty && !openAIKey.isEmpty { break }
-        }
+        if let token = OpenClawLoader.shared.readGatewayToken(configPath: state.configPath) { gatewayToken = token }
+        if let key = OpenClawLoader.shared.readAnthropicKey() { anthropicKey = key }
+        if let key = OpenClawLoader.shared.readOpenAIKey() { openAIKey = key }
+        if let key = OpenClawLoader.shared.readGeminiKey() { geminiKey = key }
+        if let key = OpenClawLoader.shared.readIBMQuantumKey() { ibmQuantumKey = key }
     }
 
     func saveKeys() {
-        var successCount = 0
-        var failCount = 0
+        var successCount = 0; var failCount = 0
 
-        for agent in state.agents {
-            guard let agentConfig = agent.agentConfig else { continue }
-            let agentDir = agentConfig.agentDir ?? ""
-            let path = ((agentDir as NSString).appendingPathComponent("auth-profiles.json") as NSString).expandingTildeInPath
-
-            var json: [String: Any] = [:]
-            if let data = FileManager.default.contents(atPath: path),
-               let existing = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                json = existing
-            }
-
-            var profiles = json["profiles"] as? [String: Any] ?? [:]
-
-            if !anthropicKey.isEmpty {
-                profiles["anthropic:default"] = [
-                    "type": "api_key",
-                    "provider": "anthropic",
-                    "key": anthropicKey
-                ]
-            }
-            if !openAIKey.isEmpty {
-                profiles["openai:default"] = [
-                    "type": "api_key",
-                    "provider": "openai",
-                    "key": openAIKey
-                ]
-            }
-
-            json["profiles"] = profiles
-
-            if let data = try? JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted]),
-               (try? data.write(to: URL(fileURLWithPath: path), options: .atomic)) != nil {
-                successCount += 1
-            } else {
-                failCount += 1
-            }
+        if !gatewayToken.isEmpty {
+            if OpenClawLoader.shared.writeGatewayToken(gatewayToken, configPath: state.configPath) { successCount += 1 } else { failCount += 1 }
         }
 
-        if failCount == 0 {
-            saveStatus = "Saved to \(successCount) agent(s) successfully"
-            isError = false
-        } else {
-            saveStatus = "Saved \(successCount), failed \(failCount)"
-            isError = true
+        var envKeys: [String: String] = [:]
+        if !anthropicKey.isEmpty  { envKeys["ANTHROPIC_API_KEY"]  = anthropicKey }
+        if !openAIKey.isEmpty     { envKeys["OPENAI_API_KEY"]     = openAIKey }
+        if !geminiKey.isEmpty     { envKeys["GOOGLE_API_KEY"]     = geminiKey }
+        if !ibmQuantumKey.isEmpty { envKeys["IBM_QUANTUM_TOKEN"]  = ibmQuantumKey }
+        if !envKeys.isEmpty {
+            if OpenClawLoader.shared.writeEnvKeys(envKeys) { successCount += 1 } else { failCount += 1 }
         }
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { saveStatus = nil }
+        guard failCount == 0 else {
+            saveStatus = "Saved \(successCount), failed \(failCount)"; isError = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { saveStatus = nil }
+            return
+        }
+
+        saveStatus = "Saved. Restarting gateway..."; isError = false; isRestarting = true
+        for i in state.agents.indices { state.agents[i].status = .restarting }
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/local/bin/openclaw")
+            process.arguments = ["gateway", "restart"]
+            var env = ProcessInfo.processInfo.environment
+            env["PATH"] = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+            env["HOME"] = NSHomeDirectory()
+            process.environment = env
+            let pipe = Pipe(); process.standardOutput = pipe; process.standardError = pipe
+            var ok = false
+            do { try process.run(); process.waitUntilExit(); ok = process.terminationStatus == 0 } catch { ok = false }
+            DispatchQueue.main.async {
+                self.isRestarting = false
+                if ok {
+                    self.saveStatus = "Saved and gateway restarted"; self.isError = false
+                    for i in self.state.agents.indices { self.state.agents[i].status = .idle }
+                } else {
+                    self.saveStatus = "Saved but restart failed — restart manually from Terminal"; self.isError = true
+                    for i in self.state.agents.indices { self.state.agents[i].status = .error }
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 5) { self.saveStatus = nil }
+            }
+        }
     }
 }
 
@@ -2302,5 +1758,4 @@ struct ContentView_Previews: PreviewProvider {
         ContentView().frame(width: 1000, height: 680)
     }
 }
-
 

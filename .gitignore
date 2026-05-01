@@ -1,0 +1,37 @@
+# Xcode build output
+DerivedData/
+build/
+*.xcarchive
+
+# Xcode user settings (machine-specific, not needed by others)
+*.xcuserstate
+xcuserdata/
+
+# macOS junk files
+.DS_Store
+**/.DS_Store
+
+# API keys and secrets — never commit these
+.env
+*.env
+auth-profiles.json
+openclaw.json
+
+# Claude session memory — never commit
+CLAUDE.md
+AGENTS.md
+.claude/
+
+# Derived data
+.deriveddata/
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# CocoaPods (if ever added)
+Pods/
+
+# Separate projects — not part of Agentics v2, will move to own repos
+exoplanet-mcp/
+quantum-mcp/
